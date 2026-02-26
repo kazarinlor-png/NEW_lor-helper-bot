@@ -1,4 +1,3 @@
-cat > init_db_sync.py << 'EOF'
 from bot import Base
 from sqlalchemy import create_engine
 import os
@@ -17,4 +16,3 @@ from sqlalchemy import inspect
 inspector = inspect(engine)
 tables = inspector.get_table_names()
 print(f"📊 Созданные таблицы: {', '.join(tables)}")
-EOF
