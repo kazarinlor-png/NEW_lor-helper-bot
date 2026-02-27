@@ -116,6 +116,10 @@ from celery.exceptions import SoftTimeLimitExceeded
 auto_install("prometheus-client", "0.19.0")
 from prometheus_client import Counter, Histogram, Gauge, start_http_server, generate_latest
 
+# ============== ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==============
+from dotenv import load_dotenv
+load_dotenv()
+
 # ============== КОНТАКТЫ КЛИНИК ==============
 
 KIT_CLINIC = {
