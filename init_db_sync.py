@@ -1,5 +1,6 @@
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
 import os
 
 # Определяем модели прямо здесь (копия из bot.py)
