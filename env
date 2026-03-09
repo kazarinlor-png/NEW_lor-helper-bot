@@ -1,0 +1,20 @@
+# Telegram Bot Token (получить у @BotFather)
+BOT_TOKEN=7374353352:AAHuRJALtv1JwcTdi2VMlziCM25KiLTwb80
+
+# ID администраторов (через запятую)
+ADMIN_IDS=308780639
+
+# Версия бота
+BOT_VERSION=14.0.0
+
+# Настройки производительности
+RATE_LIMIT_USER=1.0
+PAGE_SIZE=10
+
+# Для Codespaces используем SQLite
+USE_SQLITE=true
+DATABASE_URL=sqlite+aiosqlite:///lor_reminder.db
+SYNC_DATABASE_URL=sqlite:///lor_reminder.db
+
+# Redis (отключен)
+REDIS_ENABLED=false
