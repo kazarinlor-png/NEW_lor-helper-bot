@@ -1,28 +1,28 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+print_header "ОСТАНОВКА ЛОР-ПОМОЩНИКА"
 
-echo -e "${YELLOW}🛑 Остановка ЛОР-Помощника...${NC}"
-
-# Остановка контейнеров
-docker-compose down
-
-# Проверка, что все остановлено
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✅ Бот остановлен${NC}"
-else
-    echo -e "${RED}❌ Ошибка при остановке${NC}"
-    exit 1
+if ! check_bot_running; then
+    print_warning "Бот не запущен"
+    exit 0
 fi
 
-# Проверка запущенных контейнеров
-RUNNING=$(docker ps | grep lor-bot | wc -l)
-if [ $RUNNING -eq 0 ]; then
-    echo -e "${GREEN}✅ Все контейнеры остановлены${NC}"
+PID=$(get_bot_pid)
+print_info "Остановка процесса PID: $PID"
+
+kill $PID 2>/dev/null
+sleep 2
+
+if check_bot_running; then
+    print_warning "Принудительная остановка..."
+    kill -9 $PID 2>/dev/null
+    sleep 1
+fi
+
+if check_bot_running; then
+    print_error "Не удалось остановить бота"
 else
-    echo -e "${RED}⚠️ Некоторые контейнеры все еще запущены${NC}"
-    docker ps | grep lor-bot
+    print_success "Бот остановлен"
 fi
