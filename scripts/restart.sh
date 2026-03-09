@@ -1,19 +1,9 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+print_header "ПЕРЕЗАПУСК ЛОР-ПОМОЩНИКА"
 
-echo -e "${YELLOW}🔄 Перезапуск ЛОР-Помощника...${NC}"
-
-# Остановка
-./scripts/stop.sh
-
-# Небольшая пауза
-sleep 5
-
-# Запуск
-./scripts/start.sh
-
-echo -e "${GREEN}✅ Перезапуск завершен${NC}"
+$SCRIPT_DIR/stop.sh
+sleep 2
+$SCRIPT_DIR/start.sh
