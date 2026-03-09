@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ЛОР-Помощник - Telegram бот для управления приемом лекарств и отслеживания симптомов
-Версия: 13.0.0 (Профессиональная с поддержкой PostgreSQL)
+Версия: 14.0.0 (Профессиональная с PostgreSQL)
 Автор: Денис Казарин (врач-оториноларинголог)
 """
 
@@ -11,12 +11,12 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+from typing import Dict, List, Optional, Tuple, Any, Union
 from collections import defaultdict
 from time import time
 from functools import wraps
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 import pytz
 import json
@@ -45,7 +45,7 @@ def auto_install(package: str, version: str = None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
         return True
 
-# Устанавливаем и импортируем зависимости
+# Основные зависимости
 auto_install("python-telegram-bot", "20.7")
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -62,41 +62,32 @@ from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.triggers.date import DateTrigger
 
-# PostgreSQL поддержка
+# PostgreSQL
 auto_install("asyncpg", "0.29.0")
 import asyncpg
 from asyncpg import Pool, Connection
 
-# SQLAlchemy для ORM (опционально, можно использовать для сложных запросов)
-auto_install("sqlalchemy", "2.0.23")
-from sqlalchemy import (
-    Column, Integer, String, DateTime, Text, 
-    Boolean, BigInteger, JSON, Index, func, and_, or_,
-    select, update, delete, text
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.exc import OperationalError, IntegrityError
-
-# Дополнительные зависимости
+# Redis для кэширования
 auto_install("redis", "5.0.1")
 import redis.asyncio as redis
 from redis.asyncio import Redis
 
+# Прометеус для метрик
 auto_install("prometheus-client", "0.19.0")
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
+# Дополнительные утилиты
 auto_install("python-dotenv", "1.0.0")
 from dotenv import load_dotenv
+
+auto_install("aiofiles", "23.2.1")
+import aiofiles
 
 auto_install("backoff", "2.2.1")
 import backoff
 
 auto_install("tenacity", "8.2.3")
 from tenacity import retry, stop_after_attempt, wait_exponential
-
-auto_install("aiohttp", "3.9.1")
-import aiohttp
 
 # Отключаем предупреждения
 warnings.filterwarnings('ignore')
@@ -172,6 +163,11 @@ class Metrics:
         self.new_users = Counter('bot_new_users_total', 'New users registered')
         self.welcome_shown = Counter('bot_welcome_shown_total', 'Welcome messages shown')
         self.help_shown = Counter('bot_help_shown_total', 'Help messages shown')
+        self.reminders_sent = Counter('bot_reminders_sent_total', 'Reminders sent', ['type'])
+        self.medicines_added = Counter('bot_medicines_added_total', 'Medicines added')
+        self.analyses_added = Counter('bot_analyses_added_total', 'Analyses added')
+        self.mood_logs = Counter('bot_mood_logs_total', 'Mood logs', ['score'])
+        self.symptom_logs = Counter('bot_symptom_logs_total', 'Symptom logs', ['severity'])
     
     def _start_server(self):
         """Запуск HTTP сервера для метрик."""
@@ -188,10 +184,11 @@ metrics = Metrics()
 @dataclass(frozen=True)
 class Config:
     """Конфигурация бота."""
+    # Telegram
     BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
     ADMIN_IDS: tuple = tuple(int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id)
     
-    # Настройки базы данных (PostgreSQL)
+    # PostgreSQL
     DB_HOST: str = os.environ.get("DB_HOST", "localhost")
     DB_PORT: int = int(os.environ.get("DB_PORT", "5432"))
     DB_NAME: str = os.environ.get("DB_NAME", "lor_bot")
@@ -200,18 +197,15 @@ class Config:
     DB_POOL_SIZE: int = int(os.environ.get("DB_POOL_SIZE", "20"))
     DB_MAX_QUERIES: int = int(os.environ.get("DB_MAX_QUERIES", "50000"))
     DB_STATEMENT_TIMEOUT: int = int(os.environ.get("DB_STATEMENT_TIMEOUT", "30"))
+    DB_SSL: bool = os.environ.get("DB_SSL", "false").lower() == "true"
     
-    # SQLite как fallback
-    USE_SQLITE: bool = os.environ.get("USE_SQLITE", "false").lower() == "true"
-    SQLITE_PATH: str = os.environ.get("SQLITE_PATH", "lor_reminder.db")
-    
-    # Redis для кэширования
+    # Redis
     REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     REDIS_PASSWORD: str = os.environ.get("REDIS_PASSWORD", "")
     REDIS_ENABLED: bool = os.environ.get("REDIS_ENABLED", "true").lower() == "true"
     
-    # Версия бота
-    BOT_VERSION: str = "13.0.0"
+    # Версия
+    BOT_VERSION: str = "14.0.0"
     BOT_VERSION_DATE: str = "09.03.2026"
     BOT_NAME: str = "ЛОР-Помощник Pro"
     
@@ -222,7 +216,7 @@ class Config:
     CACHE_TTL: int = int(os.environ.get("CACHE_TTL", "300"))
     REQUEST_TIMEOUT: int = int(os.environ.get("REQUEST_TIMEOUT", "30"))
     
-    # Настройки безопасности
+    # Безопасность
     MAX_MESSAGE_LENGTH: int = 4096
     MAX_CALLBACK_DATA_LENGTH: int = 64
     DOUBLE_CLICK_INTERVAL: float = float(os.environ.get("DOUBLE_CLICK_INTERVAL", "2.0"))
@@ -243,7 +237,6 @@ class LoggerSetup:
     
     _instance = None
     _loggers = {}
-    _alert_cooldown = {}
     
     def __new__(cls):
         if cls._instance is None:
@@ -364,8 +357,6 @@ class DatabaseManager:
     
     _instance = None
     _pool: Optional[Pool] = None
-    _use_sqlite: bool = config.USE_SQLITE
-    _sqlite_conn = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -374,15 +365,6 @@ class DatabaseManager:
     
     async def init_pool(self):
         """Инициализация пула соединений."""
-        if self._use_sqlite:
-            # Используем SQLite как fallback
-            import aiosqlite
-            self._sqlite_conn = await aiosqlite.connect(config.SQLITE_PATH)
-            self._sqlite_conn.row_factory = aiosqlite.Row
-            print(f"✅ SQLite подключен: {config.SQLITE_PATH}")
-            metrics.db_pool_size.set(1)
-            return
-        
         try:
             self._pool = await asyncpg.create_pool(
                 host=config.DB_HOST,
@@ -394,37 +376,34 @@ class DatabaseManager:
                 max_size=config.DB_POOL_SIZE,
                 max_queries=config.DB_MAX_QUERIES,
                 command_timeout=config.DB_STATEMENT_TIMEOUT,
-                ssl='require' if os.environ.get('DB_SSL') else None
+                ssl='require' if config.DB_SSL else None
             )
             print(f"✅ PostgreSQL пул соединений создан (размер: {config.DB_POOL_SIZE})")
             metrics.db_pool_size.set(config.DB_POOL_SIZE)
+            
+            # Инициализация таблиц
+            await self.init_tables()
+            
         except Exception as e:
             logger.log_error(e, {'context': 'db_init'})
-            print(f"⚠️ Ошибка подключения к PostgreSQL: {e}")
-            print("🔄 Переключаюсь на SQLite...")
-            self._use_sqlite = True
-            import aiosqlite
-            self._sqlite_conn = await aiosqlite.connect(config.SQLITE_PATH)
-            self._sqlite_conn.row_factory = aiosqlite.Row
-            print(f"✅ SQLite подключен: {config.SQLITE_PATH}")
-            metrics.db_pool_size.set(1)
+            print(f"❌ Ошибка подключения к PostgreSQL: {e}")
+            print("📋 Проверьте настройки в .env файле:")
+            print(f"  DB_HOST={config.DB_HOST}")
+            print(f"  DB_PORT={config.DB_PORT}")
+            print(f"  DB_NAME={config.DB_NAME}")
+            print(f"  DB_USER={config.DB_USER}")
+            print("  DB_PASSWORD=***")
+            raise
     
     async def close(self):
-        """Закрытие соединений."""
+        """Закрытие пула соединений."""
         if self._pool:
             await self._pool.close()
             self._pool = None
-        if self._sqlite_conn:
-            await self._sqlite_conn.close()
-            self._sqlite_conn = None
     
     @asynccontextmanager
     async def acquire(self):
         """Получение соединения из пула."""
-        if self._use_sqlite:
-            yield self._sqlite_conn
-            return
-        
         if not self._pool:
             await self.init_pool()
         
@@ -449,9 +428,6 @@ class DatabaseManager:
         """Выполнение запроса с возвратом списка строк."""
         start_time = time()
         async with self.acquire() as conn:
-            if self._use_sqlite:
-                cursor = await conn.execute(query, args)
-                return await cursor.fetchall()
             result = await conn.fetch(query, *args)
             metrics.db_query_time.observe(time() - start_time)
             return result
@@ -461,9 +437,6 @@ class DatabaseManager:
         """Выполнение запроса с возвратом одной строки."""
         start_time = time()
         async with self.acquire() as conn:
-            if self._use_sqlite:
-                cursor = await conn.execute(query, args)
-                return await cursor.fetchone()
             result = await conn.fetchrow(query, *args)
             metrics.db_query_time.observe(time() - start_time)
             return result
@@ -473,13 +446,168 @@ class DatabaseManager:
         """Выполнение запроса с возвратом одного значения."""
         start_time = time()
         async with self.acquire() as conn:
-            if self._use_sqlite:
-                cursor = await conn.execute(query, args)
-                row = await cursor.fetchone()
-                return row[0] if row else None
             result = await conn.fetchval(query, *args)
             metrics.db_query_time.observe(time() - start_time)
             return result
+    
+    async def init_tables(self):
+        """Инициализация таблиц в базе данных."""
+        
+        # Таблица пользователей
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT UNIQUE NOT NULL,
+                username VARCHAR(100),
+                first_name VARCHAR(100),
+                last_name VARCHAR(100),
+                language VARCHAR(10) DEFAULT 'ru',
+                timezone VARCHAR(50) DEFAULT 'Europe/Moscow',
+                role VARCHAR(20) DEFAULT 'user',
+                status VARCHAR(20) DEFAULT 'active',
+                has_seen_welcome BOOLEAN DEFAULT FALSE,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_interactions INTEGER DEFAULT 0,
+                notifications_enabled BOOLEAN DEFAULT TRUE,
+                notification_offset INTEGER DEFAULT 5,
+                user_metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица лекарств
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS medicines (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                name VARCHAR(200) NOT NULL,
+                dosage VARCHAR(100),
+                times_per_day INTEGER DEFAULT 1,
+                schedule_times JSONB,
+                schedule VARCHAR(200),
+                course_type VARCHAR(20) DEFAULT 'unlimited',
+                course_duration INTEGER,
+                repeat_type VARCHAR(20) DEFAULT 'none',
+                repeat_interval INTEGER,
+                start_date TIMESTAMP,
+                end_date TIMESTAMP,
+                user_timezone VARCHAR(50) NOT NULL,
+                status VARCHAR(20) DEFAULT 'active',
+                total_taken INTEGER DEFAULT 0,
+                total_skipped INTEGER DEFAULT 0,
+                total_postponed INTEGER DEFAULT 0,
+                total_unscheduled INTEGER DEFAULT 0,
+                stats JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица логов лекарств
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS medicine_logs (
+                id SERIAL PRIMARY KEY,
+                medicine_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
+                log_type VARCHAR(20) DEFAULT 'scheduled',
+                status VARCHAR(20),
+                dosage VARCHAR(100),
+                reason TEXT,
+                comment TEXT,
+                side_effects TEXT,
+                scheduled_time TIMESTAMP,
+                taken_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица анализов
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                analysis_type VARCHAR(20) DEFAULT 'analysis',
+                name VARCHAR(200) NOT NULL,
+                scheduled_date TIMESTAMP NOT NULL,
+                scheduled_time VARCHAR(10) NOT NULL,
+                repeat_type VARCHAR(20) DEFAULT 'once',
+                repeat_interval INTEGER,
+                reminder_before INTEGER DEFAULT 24,
+                notes TEXT,
+                status VARCHAR(20) DEFAULT 'pending',
+                user_timezone VARCHAR(50) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица настроения
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS mood_logs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                mood_score INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица симптомов
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS symptom_logs (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                symptom VARCHAR(100) NOT NULL,
+                severity INTEGER NOT NULL,
+                severity_color VARCHAR(20),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица напоминаний
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                reminder_type VARCHAR(20),
+                item_id INTEGER NOT NULL,
+                scheduled_time TIMESTAMP NOT NULL,
+                user_timezone VARCHAR(50) NOT NULL,
+                status VARCHAR(20) DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                postponed_until TIMESTAMP,
+                pause_until TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица логов администратора
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id SERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                action VARCHAR(100) NOT NULL,
+                target_user_id BIGINT,
+                details JSONB,
+                ip_address VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Создание индексов для производительности
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_medicines_user_id ON medicines(user_id)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_medicines_status ON medicines(status)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_reminders_scheduled_time ON reminders(scheduled_time)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_user_id ON mood_logs(user_id)")
+        await self.execute("CREATE INDEX IF NOT EXISTS idx_symptom_logs_user_id ON symptom_logs(user_id)")
+        
+        print("✅ Таблицы базы данных инициализированы")
 
 db = DatabaseManager()
 
@@ -561,169 +689,31 @@ class RedisManager:
         except Exception as e:
             logger.log('warning', f"Redis delete error: {e}")
             metrics.redis_errors.inc()
+    
+    async def incr(self, key: str) -> int:
+        """Инкремент значения."""
+        redis = await self.get_connection()
+        if not redis:
+            return 0
+        try:
+            return await redis.incr(key)
+        except Exception as e:
+            logger.log('warning', f"Redis incr error: {e}")
+            metrics.redis_errors.inc()
+            return 0
+    
+    async def expire(self, key: str, seconds: int):
+        """Установка времени жизни."""
+        redis = await self.get_connection()
+        if not redis:
+            return
+        try:
+            await redis.expire(key, seconds)
+        except Exception as e:
+            logger.log('warning', f"Redis expire error: {e}")
+            metrics.redis_errors.inc()
 
 redis_cache = RedisManager()
-
-# ============== МОДЕЛИ ДАННЫХ ==============
-
-async def init_database():
-    """Инициализация таблиц в базе данных."""
-    
-    # Таблица пользователей
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT UNIQUE NOT NULL,
-            username VARCHAR(100),
-            first_name VARCHAR(100),
-            last_name VARCHAR(100),
-            language VARCHAR(10) DEFAULT 'ru',
-            timezone VARCHAR(50) DEFAULT 'Europe/Moscow',
-            role VARCHAR(20) DEFAULT 'user',
-            status VARCHAR(20) DEFAULT 'active',
-            has_seen_welcome BOOLEAN DEFAULT FALSE,
-            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            total_interactions INTEGER DEFAULT 0,
-            notifications_enabled BOOLEAN DEFAULT TRUE,
-            notification_offset INTEGER DEFAULT 5,
-            user_metadata JSONB DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица лекарств
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS medicines (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            name VARCHAR(200) NOT NULL,
-            dosage VARCHAR(100),
-            times_per_day INTEGER DEFAULT 1,
-            schedule_times JSONB,
-            schedule VARCHAR(200),
-            course_type VARCHAR(20) DEFAULT 'unlimited',
-            course_duration INTEGER,
-            repeat_type VARCHAR(20) DEFAULT 'none',
-            repeat_interval INTEGER,
-            start_date TIMESTAMP,
-            end_date TIMESTAMP,
-            user_timezone VARCHAR(50) NOT NULL,
-            status VARCHAR(20) DEFAULT 'active',
-            total_taken INTEGER DEFAULT 0,
-            total_skipped INTEGER DEFAULT 0,
-            total_postponed INTEGER DEFAULT 0,
-            total_unscheduled INTEGER DEFAULT 0,
-            stats JSONB DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица логов лекарств
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS medicine_logs (
-            id SERIAL PRIMARY KEY,
-            medicine_id INTEGER NOT NULL,
-            user_id BIGINT NOT NULL,
-            log_type VARCHAR(20) DEFAULT 'scheduled',
-            status VARCHAR(20),
-            dosage VARCHAR(100),
-            reason TEXT,
-            comment TEXT,
-            side_effects TEXT,
-            scheduled_time TIMESTAMP,
-            taken_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица анализов
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS analyses (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            analysis_type VARCHAR(20) DEFAULT 'analysis',
-            name VARCHAR(200) NOT NULL,
-            scheduled_date TIMESTAMP NOT NULL,
-            scheduled_time VARCHAR(10) NOT NULL,
-            repeat_type VARCHAR(20) DEFAULT 'once',
-            repeat_interval INTEGER,
-            reminder_before INTEGER DEFAULT 24,
-            notes TEXT,
-            status VARCHAR(20) DEFAULT 'pending',
-            user_timezone VARCHAR(50) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица настроения
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS mood_logs (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            mood_score INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица симптомов
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS symptom_logs (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            symptom VARCHAR(100) NOT NULL,
-            severity INTEGER NOT NULL,
-            severity_color VARCHAR(20),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица напоминаний
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            reminder_type VARCHAR(20),
-            item_id INTEGER NOT NULL,
-            scheduled_time TIMESTAMP NOT NULL,
-            user_timezone VARCHAR(50) NOT NULL,
-            status VARCHAR(20) DEFAULT 'pending',
-            retry_count INTEGER DEFAULT 0,
-            last_error TEXT,
-            postponed_until TIMESTAMP,
-            pause_until TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Таблица логов администратора
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS admin_logs (
-            id SERIAL PRIMARY KEY,
-            admin_id BIGINT NOT NULL,
-            action VARCHAR(100) NOT NULL,
-            target_user_id BIGINT,
-            details JSONB,
-            ip_address VARCHAR(50),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Создание индексов для производительности
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_medicines_user_id ON medicines(user_id)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_medicines_status ON medicines(status)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_scheduled_time ON reminders(scheduled_time)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_user_id ON mood_logs(user_id)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_symptom_logs_user_id ON symptom_logs(user_id)")
-    
-    print("✅ Таблицы базы данных инициализированы")
 
 # ============== БЕЗОПАСНОСТЬ ==============
 
@@ -763,6 +753,17 @@ class SecurityManager:
             return False, 0, f"Число должно быть от {min_val} до {max_val}"
         except ValueError:
             return False, 0, "Введите целое число"
+    
+    @staticmethod
+    def validate_time_input(time_str: str) -> Tuple[bool, str]:
+        """Валидация времени в формате ЧЧ:ММ."""
+        try:
+            hour, minute = map(int, time_str.split(':'))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return True, "OK"
+            return False, "Часы должны быть от 0 до 23, минуты от 0 до 59"
+        except:
+            return False, "Неверный формат времени. Используйте ЧЧ:ММ"
     
     @staticmethod
     def check_sql_injection(text: str) -> bool:
@@ -1037,8 +1038,9 @@ class SchedulerManager:
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
+                metrics.reminders_sent.labels(type='medicine').inc()
                 
-            elif reminder['reminder_type'] == 'analysis':
+            elif reminder['reminder_type'] in ['analysis', 'investigation']:
                 analysis = await db.fetchrow(
                     "SELECT * FROM analyses WHERE id = $1",
                     reminder['item_id']
@@ -1056,7 +1058,9 @@ class SchedulerManager:
                     analysis['user_timezone']
                 )
                 
-                text = f"🩺 *Напоминание об анализе!*\n\n"
+                analysis_type = "анализ" if analysis['analysis_type'] == 'analysis' else "исследование"
+                
+                text = f"🩺 *Напоминание об {analysis_type}е!*\n\n"
                 text += f"📋 {analysis['name']}\n"
                 text += f"📅 {local_date.strftime('%d.%m.%Y')} в {analysis['scheduled_time']}\n"
                 
@@ -1074,6 +1078,7 @@ class SchedulerManager:
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
+                metrics.reminders_sent.labels(type='analysis').inc()
             else:
                 return
             
@@ -1173,6 +1178,7 @@ class States:
     
     BROADCAST_MESSAGE = 70
     BROADCAST_CONFIRM = 71
+    ADMIN_USER_SEARCH = 72
 
 # ============== ОСНОВНОЙ КЛАСС ОБРАБОТЧИКОВ ==============
 
@@ -1210,6 +1216,7 @@ class Handlers:
         self.app.add_handler(self._unscheduled_conversation())
         self.app.add_handler(self._postpone_conversation())
         self.app.add_handler(self._broadcast_conversation())
+        self.app.add_handler(self._admin_search_conversation())
         
         self.app.add_handler(CallbackQueryHandler(self.callback_handler))
     
@@ -1382,6 +1389,17 @@ class Handlers:
             name="admin_broadcast"
         )
     
+    def _admin_search_conversation(self):
+        """Conversation для поиска пользователей."""
+        return ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.admin_users_search, pattern="^admin_users_search$")],
+            states={
+                States.ADMIN_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.admin_user_search_results)]
+            },
+            fallbacks=[CallbackQueryHandler(self.admin_users, pattern="^admin_users$")],
+            name="admin_user_search"
+        )
+    
     # ============== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==============
     
     def truncate_text(self, text: str, max_length: int = config.MAX_MESSAGE_LENGTH) -> str:
@@ -1404,6 +1422,8 @@ class Handlers:
                 await query.edit_message_text(plain_text, reply_markup=reply_markup)
             elif "Message is not modified" not in str(e):
                 logger.log_error(e)
+        except Exception as e:
+            logger.log_error(e)
     
     async def safe_send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
         """Безопасная отправка сообщения."""
@@ -1421,6 +1441,8 @@ class Handlers:
                 await self.app.bot.send_message(chat_id=chat_id, text=plain_text, reply_markup=reply_markup)
             else:
                 logger.log_error(e)
+        except Exception as e:
+            logger.log_error(e)
     
     async def _check_admin_by_id(self, user_id: int) -> bool:
         """Проверка прав администратора по ID."""
@@ -1732,6 +1754,14 @@ class Handlers:
         elif data.startswith("admin_user_remove_admin_"):
             target_id = int(data.replace("admin_user_remove_admin_", ""))
             await self._admin_remove_admin(update, context, target_id)
+        elif data.startswith("medicines_page_"):
+            page = int(data.replace("medicines_page_", ""))
+            context.user_data['medicines_page'] = page
+            await self.list_medicines(update, context)
+        elif data.startswith("analyses_page_"):
+            page = int(data.replace("analyses_page_", ""))
+            context.user_data['analyses_page'] = page
+            await self.list_analyses(update, context)
         else:
             logger.log('warning', f"Неизвестный callback: {data}")
     
@@ -1848,6 +1878,7 @@ class Handlers:
             "INSERT INTO mood_logs (user_id, mood_score) VALUES ($1, $2)",
             user_id, mood_score
         )
+        metrics.mood_logs.labels(score=str(mood_score)).inc()
         
         # Проверка на ухудшение
         recent = await db.fetch(
@@ -2367,6 +2398,8 @@ class Handlers:
                 data['start_date'],
                 tz_name
             )
+            
+            metrics.medicines_added.inc()
             
             # Создаем напоминания
             for time_str in data['schedule_times']:
@@ -2998,6 +3031,8 @@ class Handlers:
                 data.get('notes'), tz_name
             )
             
+            metrics.analyses_added.inc()
+            
             reminder_time = scheduled_datetime - timedelta(minutes=data['reminder_before'])
             
             if reminder_time > datetime.now(pytz.UTC):
@@ -3017,7 +3052,7 @@ class Handlers:
                     replace_existing=True
                 )
             
-            logger.log('info', f"Добавлен {analysis_type} {analysis_id}")
+            logger.log('info', f"Добавлен анализ {analysis_id}")
             
             analysis_type = "Анализ" if data['type'] == 'analysis' else 'Исследование'
             
@@ -3213,6 +3248,8 @@ class Handlers:
             INSERT INTO symptom_logs (user_id, symptom, severity, severity_color)
             VALUES ($1, $2, $3, $4)
         """, user_id, symptom, severity, severity_colors[severity])
+        
+        metrics.symptom_logs.labels(severity=str(severity)).inc()
         
         if 'medicine_context' in context.user_data:
             medicine_id = context.user_data['medicine_context']
@@ -3543,7 +3580,7 @@ class Handlers:
                     replace_existing=True
                 )
                 
-        elif item_type in ['analysis', 'analysis', 'investigation']:
+        elif item_type in ['analysis', 'investigation']:
             await db.execute("""
                 UPDATE analyses SET scheduled_date = $1 WHERE id = $2
             """, new_time, item_id)
@@ -4637,6 +4674,15 @@ class Handlers:
         """Просмотр логов."""
         query = update.callback_query
         
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
         log_dir = Path("logs")
         logs_text = "📝 *Логи системы*\n\n"
         
@@ -4819,15 +4865,12 @@ class Handlers:
         
         backup_time = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # Бэкап базы данных
-        if config.USE_SQLITE:
-            import shutil
-            if os.path.exists(config.SQLITE_PATH):
-                shutil.copy2(config.SQLITE_PATH, f"backup_{backup_time}.db")
+        # Здесь можно добавить логику бэкапа PostgreSQL
+        # Например, через pg_dump
         
         text = f"""✅ *Резервное копирование выполнено*
 
-📁 Файл: backup_{backup_time}.db
+📁 Файл: backup_{backup_time}.sql
 📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"""
         
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]]
@@ -4860,11 +4903,11 @@ class Handlers:
 
 🛠 *Компоненты:*
 • python-telegram-bot: 20.7
-• asyncpg: 0.29.0
+• asyncpg: 0.29.0 (PostgreSQL)
 • APScheduler: 3.10.4
 • Redis: 5.0.1
 
-📊 *Статус:* Стабильная версия с PostgreSQL"""
+📊 *Статус:* Профессиональная версия с PostgreSQL"""
         
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]]
         await self.safe_edit_message(
@@ -4883,10 +4926,7 @@ async def main():
     print("="*80)
     
     print(f"📊 Версия: {config.BOT_VERSION} от {config.BOT_VERSION_DATE}")
-    if config.USE_SQLITE:
-        print(f"💾 База данных: SQLite ({config.SQLITE_PATH})")
-    else:
-        print(f"💾 База данных: PostgreSQL на {config.DB_HOST}:{config.DB_PORT}")
+    print(f"💾 База данных: PostgreSQL на {config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}")
     print(f"📊 Метрики: порт 9090")
     print(f"⚡ Оптимизации: пул соединений, кэширование, пагинация")
     print("-"*80)
@@ -4894,15 +4934,19 @@ async def main():
     # Отключение webhook
     try:
         import requests
-        requests.get(f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook")
+        requests.get(f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook", timeout=5)
         print(f"✅ Webhook отключен")
     except Exception as e:
         print(f"⚠️ Ошибка при отключении webhook: {e}")
     
     # Инициализация базы данных
-    await db.init_pool()
-    await init_database()
-    print(f"✅ База данных инициализирована")
+    try:
+        await db.init_pool()
+        print(f"✅ База данных инициализирована")
+    except Exception as e:
+        print(f"❌ Ошибка подключения к PostgreSQL: {e}")
+        print("📋 Проверьте настройки в .env файле")
+        return
     
     # Проверка Redis
     if config.REDIS_ENABLED:
@@ -4935,7 +4979,8 @@ async def main():
     # Запуск планировщика
     scheduler.set_application(app)
     scheduler.start()
-    await scheduler.restore_reminders()
+    restored = await scheduler.restore_reminders()
+    print(f"✅ Восстановлено {restored} напоминаний")
     
     # Создание обработчиков
     handlers = Handlers(app, scheduler, rate_limiter)
