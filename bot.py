@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ЛОР-Помощник Pro - Коммерческая версия
-Telegram бот для управления приемом лекарств с поддержкой мультитенантности,
-подписок и белого брендирования для клиник.
-
-Версия: 13.0.0 (Коммерческая)
+ЛОР-Помощник - Telegram бот для управления приемом лекарств и отслеживания симптомов
+Версия: 13.0.0 (Профессиональная с поддержкой PostgreSQL)
 Автор: Денис Казарин (врач-оториноларинголог)
-Лицензия: Проприетарная
 """
 
 import asyncio
@@ -15,7 +11,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable
 from collections import defaultdict
 from time import time
 from functools import wraps
@@ -25,103 +21,160 @@ from enum import Enum
 import pytz
 import json
 import re
-import uuid
-import hashlib
-import hmac
-import secrets
-import aiohttp
+import warnings
+import signal
+import traceback
+import io
+import csv
+from pathlib import Path
+
+# ============== ИМПОРТЫ С АВТОУСТАНОВКОЙ ==============
+
+def auto_install(package: str, version: str = None):
+    """Автоматическая установка пакета при необходимости."""
+    try:
+        if version:
+            __import__(package.split('==')[0])
+        else:
+            __import__(package)
+        return True
+    except ImportError:
+        import subprocess
+        pkg = f"{package}=={version}" if version else package
+        print(f"📦 Устанавливаем {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        return True
+
+# Устанавливаем и импортируем зависимости
+auto_install("python-telegram-bot", "20.7")
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, MessageHandler, filters, ContextTypes
+)
+from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut, BadRequest, Forbidden
+
+auto_install("apscheduler", "3.10.4")
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.executors.asyncio import AsyncIOExecutor
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.triggers.date import DateTrigger
+
+# PostgreSQL поддержка
+auto_install("asyncpg", "0.29.0")
 import asyncpg
+from asyncpg import Pool, Connection
+
+# SQLAlchemy для ORM (опционально, можно использовать для сложных запросов)
+auto_install("sqlalchemy", "2.0.23")
+from sqlalchemy import (
+    Column, Integer, String, DateTime, Text, 
+    Boolean, BigInteger, JSON, Index, func, and_, or_,
+    select, update, delete, text
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.exc import OperationalError, IntegrityError
+
+# Дополнительные зависимости
+auto_install("redis", "5.0.1")
 import redis.asyncio as redis
 from redis.asyncio import Redis
+
+auto_install("prometheus-client", "0.19.0")
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
-import async_timeout
+
+auto_install("python-dotenv", "1.0.0")
+from dotenv import load_dotenv
+
+auto_install("backoff", "2.2.1")
 import backoff
 
+auto_install("tenacity", "8.2.3")
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+auto_install("aiohttp", "3.9.1")
+import aiohttp
+
 # Отключаем предупреждения
-import warnings
 warnings.filterwarnings('ignore')
 
-# ============== КОНФИГУРАЦИЯ ==============
+# ============== ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==============
+load_dotenv()
 
-@dataclass(frozen=True)
-class Config:
-    """Конфигурация коммерческого бота."""
-    # Основные настройки
-    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
-    BOT_VERSION: str = "13.0.0"
-    BOT_VERSION_DATE: str = "06.03.2026"
-    BOT_NAME: str = "ЛОР-Помощник Pro"
-    
-    # База данных (PostgreSQL вместо SQLite)
-    DB_HOST: str = os.environ.get("DB_HOST", "localhost")
-    DB_PORT: int = int(os.environ.get("DB_PORT", "5432"))
-    DB_NAME: str = os.environ.get("DB_NAME", "lor_bot")
-    DB_USER: str = os.environ.get("DB_USER", "lor_bot")
-    DB_PASSWORD: str = os.environ.get("DB_PASSWORD", "")
-    DB_POOL_SIZE: int = int(os.environ.get("DB_POOL_SIZE", "50"))
-    DB_MAX_QUERIES: int = int(os.environ.get("DB_MAX_QUERIES", "50000"))
-    
-    # Redis для кэширования и очередей
-    REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-    
-    # Платежные системы
-    TELEGRAM_PAYMENT_TOKEN: str = os.environ.get("TELEGRAM_PAYMENT_TOKEN", "")
-    YOOKASSA_SHOP_ID: str = os.environ.get("YOOKASSA_SHOP_ID", "")
-    YOOKASSA_SECRET_KEY: str = os.environ.get("YOOKASSA_SECRET_KEY", "")
-    YOOKASSA_RETURN_URL: str = os.environ.get("YOOKASSA_RETURN_URL", "https://t.me/your_bot")
-    
-    # Webhook для уведомлений
-    WEBHOOK_URL: str = os.environ.get("WEBHOOK_URL", "")
-    WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", "")
-    
-    # Администраторы платформы
-    PLATFORM_ADMIN_IDS: tuple = tuple(int(id) for id in os.environ.get("PLATFORM_ADMIN_IDS", "").split(",") if id)
-    
-    # Настройки производительности
-    REQUEST_TIMEOUT: int = 10
-    CACHE_TTL: int = 300
-    RATE_LIMIT_USER: float = 0.5
-    
-    def __post_init__(self):
-        if not self.BOT_TOKEN:
-            raise ValueError("❌ Не установлен BOT_TOKEN")
+# ============== КОНТАКТЫ КЛИНИК ==============
 
-config = Config()
+KIT_CLINIC = {
+    "name": "🏥 КИТ-клиника (Куркино)",
+    "address": "г. Москва, ул. Соколово-Мещерская, д. 16/114",
+    "phone": "+74957775580",
+    "phone_display": "8 (495) 777-55-80",
+    "site": "https://kit-clinic.ru/doctors/kazarin-denis-sergeevich/",
+    "maps": "https://yandex.ru/maps/-/CPQZIPYD",
+    "booking": "https://kit-clinic.ru/doctors/kazarin-denis-sergeevich/#reception"
+}
 
-# ============== МЕТРИКИ ==============
+FAMILY_CLINIC = {
+    "name": "🏥 Семейная клиника (Путилково)",
+    "address": "МО, Красногорский р-н, пгт Путилково, Спасо-Тушинский бульвар, д. 5",
+    "phone": "+74987317555",
+    "phone_display": "8 (498) 731-75-55",
+    "site": "https://klinika-bz.ru/speczialistyi/kazarin-denis-sergeevich",
+    "maps": "https://yandex.ru/maps/-/CPEBA46u",
+    "booking": "https://klinika-bz.ru/speczialistyi/kazarin-denis-sergeevich#reception"
+}
+
+DOCTOR_INFO = """👨‍⚕️ *Денис Сергеевич Казарин* - врач-оториноларинголог
+
+👶 *Ведет прием детей с 0 лет и взрослых*
+
+🎓 *Образование:*
+• 2001-2007: МГМСУ им. А.И. Евдокимова
+• 2007-2009: Ординатура, РМАПО
+• Лазерная медицина (НПЦ лазерной медицины)
+
+📱 *Социальные сети:*
+• 👥 Telegram канал: @KAZARIN_LOR
+• 💬 Личный Telegram: @deniskazarin"""
+
+# ============== МЕТРИКИ PROMETHEUS ==============
 
 class Metrics:
-    """Система метрик для мониторинга бизнес-показателей."""
+    """Система метрик Prometheus."""
     
     _instance = None
+    _started = False
     
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._setup_metrics()
         return cls._instance
     
+    def __init__(self):
+        if not self._started:
+            self._setup_metrics()
+            self._start_server()
+            self._started = True
+    
     def _setup_metrics(self):
-        """Инициализация бизнес-метрик."""
-        # Технические метрики
-        self.requests = Counter('bot_requests', 'Requests', ['handler', 'tenant'])
-        self.errors = Counter('bot_errors', 'Errors', ['type', 'tenant'])
-        self.response_time = Histogram('bot_response_time', 'Response time', ['handler'])
-        
-        # Бизнес-метрики
-        self.active_users = Gauge('business_active_users', 'Active users', ['tenant'])
-        self.paid_users = Gauge('business_paid_users', 'Paid users', ['plan'])
-        self.revenue = Counter('business_revenue', 'Revenue', ['plan', 'currency'])
-        self.subscriptions = Counter('business_subscriptions', 'Subscriptions', ['plan', 'action'])
-        self.tenant_count = Gauge('business_tenants', 'Active tenants')
-        
-        # Медицинские метрики
-        self.medicines_tracked = Counter('medical_medicines', 'Medicines tracked', ['tenant'])
-        self.adherence_rate = Histogram('medical_adherence', 'Adherence rate', ['tenant'])
-        self.mood_logs = Counter('medical_mood', 'Mood logs', ['score'])
-        self.symptom_logs = Counter('medical_symptoms', 'Symptom logs', ['severity'])
-        
-        # Запуск HTTP сервера для Prometheus
+        """Инициализация метрик."""
+        self.requests_total = Counter('bot_requests_total', 'Total requests', ['handler', 'status'])
+        self.errors_total = Counter('bot_errors_total', 'Total errors', ['type'])
+        self.request_duration = Histogram('bot_request_duration_seconds', 'Request duration', ['handler'])
+        self.active_users = Gauge('bot_active_users', 'Active users')
+        self.db_pool_size = Gauge('bot_db_pool_size', 'Database pool size')
+        self.db_query_time = Histogram('bot_db_query_seconds', 'Database query time')
+        self.db_connection_errors = Counter('bot_db_connection_errors_total', 'DB connection errors')
+        self.redis_connections = Gauge('bot_redis_connections', 'Redis connections')
+        self.redis_errors = Counter('bot_redis_errors_total', 'Redis errors')
+        self.new_users = Counter('bot_new_users_total', 'New users registered')
+        self.welcome_shown = Counter('bot_welcome_shown_total', 'Welcome messages shown')
+        self.help_shown = Counter('bot_help_shown_total', 'Help messages shown')
+    
+    def _start_server(self):
+        """Запуск HTTP сервера для метрик."""
         try:
             start_http_server(9090)
             print(f"📊 Метрики доступны на порту 9090")
@@ -130,38 +183,179 @@ class Metrics:
 
 metrics = Metrics()
 
-# ============== МОДЕЛИ ДАННЫХ ==============
+# ============== КОНФИГУРАЦИЯ ==============
 
-class SubscriptionPlan(str, Enum):
-    """Тарифные планы."""
-    FREE = "free"
-    PREMIUM = "premium"
-    PROFESSIONAL = "professional"
-    ENTERPRISE = "enterprise"
+@dataclass(frozen=True)
+class Config:
+    """Конфигурация бота."""
+    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
+    ADMIN_IDS: tuple = tuple(int(id) for id in os.environ.get("ADMIN_IDS", "").split(",") if id)
+    
+    # Настройки базы данных (PostgreSQL)
+    DB_HOST: str = os.environ.get("DB_HOST", "localhost")
+    DB_PORT: int = int(os.environ.get("DB_PORT", "5432"))
+    DB_NAME: str = os.environ.get("DB_NAME", "lor_bot")
+    DB_USER: str = os.environ.get("DB_USER", "lor_bot")
+    DB_PASSWORD: str = os.environ.get("DB_PASSWORD", "")
+    DB_POOL_SIZE: int = int(os.environ.get("DB_POOL_SIZE", "20"))
+    DB_MAX_QUERIES: int = int(os.environ.get("DB_MAX_QUERIES", "50000"))
+    DB_STATEMENT_TIMEOUT: int = int(os.environ.get("DB_STATEMENT_TIMEOUT", "30"))
+    
+    # SQLite как fallback
+    USE_SQLITE: bool = os.environ.get("USE_SQLITE", "false").lower() == "true"
+    SQLITE_PATH: str = os.environ.get("SQLITE_PATH", "lor_reminder.db")
+    
+    # Redis для кэширования
+    REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_PASSWORD: str = os.environ.get("REDIS_PASSWORD", "")
+    REDIS_ENABLED: bool = os.environ.get("REDIS_ENABLED", "true").lower() == "true"
+    
+    # Версия бота
+    BOT_VERSION: str = "13.0.0"
+    BOT_VERSION_DATE: str = "09.03.2026"
+    BOT_NAME: str = "ЛОР-Помощник Pro"
+    
+    # Настройки производительности
+    RATE_LIMIT_USER: float = float(os.environ.get("RATE_LIMIT_USER", "1.0"))
+    REMINDER_RETRY_COUNT: int = int(os.environ.get("REMINDER_RETRY_COUNT", "5"))
+    INTEGRITY_CHECK_INTERVAL: int = int(os.environ.get("INTEGRITY_CHECK_INTERVAL", "1800"))
+    CACHE_TTL: int = int(os.environ.get("CACHE_TTL", "300"))
+    REQUEST_TIMEOUT: int = int(os.environ.get("REQUEST_TIMEOUT", "30"))
+    
+    # Настройки безопасности
+    MAX_MESSAGE_LENGTH: int = 4096
+    MAX_CALLBACK_DATA_LENGTH: int = 64
+    DOUBLE_CLICK_INTERVAL: float = float(os.environ.get("DOUBLE_CLICK_INTERVAL", "2.0"))
+    
+    # Пагинация
+    PAGE_SIZE: int = int(os.environ.get("PAGE_SIZE", "10"))
+    
+    def __post_init__(self):
+        if not self.BOT_TOKEN:
+            raise ValueError("❌ Не установлен BOT_TOKEN")
 
-class UserRole(str, Enum):
-    """Роли пользователей."""
-    PATIENT = "patient"           # Обычный пациент
-    DOCTOR = "doctor"              # Врач (арендатор)
-    DOCTOR_ADMIN = "doctor_admin"  # Главный врач клиники
-    TENANT_ADMIN = "tenant_admin"  # Администратор клиента
-    PLATFORM_ADMIN = "platform_admin"  # Владелец платформы
+config = Config()
 
-class PaymentStatus(str, Enum):
-    """Статусы платежей."""
-    PENDING = "pending"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    REFUNDED = "refunded"
-    CANCELLED = "cancelled"
+# ============== НАСТРОЙКА ЛОГИРОВАНИЯ ==============
 
-class SubscriptionStatus(str, Enum):
-    """Статусы подписок."""
-    ACTIVE = "active"
-    TRIAL = "trial"
-    EXPIRED = "expired"
-    CANCELLED = "cancelled"
-    SUSPENDED = "suspended"
+class LoggerSetup:
+    """Система логирования."""
+    
+    _instance = None
+    _loggers = {}
+    _alert_cooldown = {}
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        self._setup_loggers()
+    
+    def _setup_loggers(self):
+        """Настройка всех уровней логирования."""
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        
+        from logging.handlers import RotatingFileHandler
+        
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        
+        for name, level in [
+            ('info', logging.INFO),
+            ('error', logging.ERROR),
+            ('warning', logging.WARNING),
+            ('debug', logging.DEBUG),
+            ('audit', logging.INFO)
+        ]:
+            logger = logging.getLogger(name)
+            logger.setLevel(level)
+            
+            if name == 'info':
+                logger.addHandler(console)
+            
+            handler = RotatingFileHandler(
+                log_dir / f'{name}.log',
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
+                encoding='utf-8'
+            )
+            
+            if name == 'error':
+                formatter = logging.Formatter(
+                    '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s\n%(exc_info)s'
+                )
+            else:
+                formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            self._loggers[name] = logger
+    
+    def log(self, level: str, message: str, **kwargs):
+        """Логирование."""
+        if level in self._loggers:
+            if level in ['error', 'warning']:
+                metrics.errors_total.labels(type=level).inc()
+            
+            if level == 'audit':
+                log_entry = {
+                    'timestamp': datetime.now().isoformat(),
+                    'message': message,
+                    **kwargs
+                }
+                self._loggers[level].info(json.dumps(log_entry, ensure_ascii=False))
+            else:
+                getattr(self._loggers[level], level)(message)
+    
+    def log_error(self, error: Exception, context: Dict = None):
+        """Логирование ошибки с контекстом."""
+        error_msg = f"Error: {str(error)}\n"
+        if context:
+            error_msg += f"Context: {json.dumps(context, ensure_ascii=False, default=str)}\n"
+        error_msg += f"Traceback: {traceback.format_exc()}"
+        
+        self._loggers['error'].error(error_msg)
+        metrics.errors_total.labels(type=type(error).__name__).inc()
+
+logger = LoggerSetup()
+
+# ============== ДЕКОРАТОРЫ ==============
+
+def measure_time(func):
+    """Декоратор для замера времени выполнения."""
+    @wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        start = time()
+        try:
+            result = await func(*args, **kwargs)
+            return result
+        finally:
+            duration = time() - start
+            if duration > 1.0:
+                logger.log('warning', f"Медленная операция: {func.__name__} - {duration:.2f}s")
+    return async_wrapper
+
+def retry_on_error(max_attempts: int = 3, delay: float = 1.0):
+    """Декоратор для повторных попыток при ошибках."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(delay * (attempt + 1))
+                    logger.log('warning', f"Попытка {attempt + 1} для {func.__name__} не удалась: {e}")
+            raise last_error
+        return wrapper
+    return decorator
 
 # ============== МЕНЕДЖЕР БАЗЫ ДАННЫХ (POSTGRESQL) ==============
 
@@ -169,7 +363,9 @@ class DatabaseManager:
     """Асинхронный менеджер PostgreSQL с пулом соединений."""
     
     _instance = None
-    _pool: Optional[asyncpg.Pool] = None
+    _pool: Optional[Pool] = None
+    _use_sqlite: bool = config.USE_SQLITE
+    _sqlite_conn = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -178,95 +374,151 @@ class DatabaseManager:
     
     async def init_pool(self):
         """Инициализация пула соединений."""
-        if not self._pool:
+        if self._use_sqlite:
+            # Используем SQLite как fallback
+            import aiosqlite
+            self._sqlite_conn = await aiosqlite.connect(config.SQLITE_PATH)
+            self._sqlite_conn.row_factory = aiosqlite.Row
+            print(f"✅ SQLite подключен: {config.SQLITE_PATH}")
+            metrics.db_pool_size.set(1)
+            return
+        
+        try:
             self._pool = await asyncpg.create_pool(
                 host=config.DB_HOST,
                 port=config.DB_PORT,
                 database=config.DB_NAME,
                 user=config.DB_USER,
                 password=config.DB_PASSWORD,
-                min_size=10,
+                min_size=5,
                 max_size=config.DB_POOL_SIZE,
                 max_queries=config.DB_MAX_QUERIES,
-                command_timeout=config.REQUEST_TIMEOUT,
+                command_timeout=config.DB_STATEMENT_TIMEOUT,
                 ssl='require' if os.environ.get('DB_SSL') else None
             )
             print(f"✅ PostgreSQL пул соединений создан (размер: {config.DB_POOL_SIZE})")
+            metrics.db_pool_size.set(config.DB_POOL_SIZE)
+        except Exception as e:
+            logger.log_error(e, {'context': 'db_init'})
+            print(f"⚠️ Ошибка подключения к PostgreSQL: {e}")
+            print("🔄 Переключаюсь на SQLite...")
+            self._use_sqlite = True
+            import aiosqlite
+            self._sqlite_conn = await aiosqlite.connect(config.SQLITE_PATH)
+            self._sqlite_conn.row_factory = aiosqlite.Row
+            print(f"✅ SQLite подключен: {config.SQLITE_PATH}")
+            metrics.db_pool_size.set(1)
     
     async def close(self):
-        """Закрытие пула соединений."""
+        """Закрытие соединений."""
         if self._pool:
             await self._pool.close()
             self._pool = None
+        if self._sqlite_conn:
+            await self._sqlite_conn.close()
+            self._sqlite_conn = None
     
     @asynccontextmanager
     async def acquire(self):
         """Получение соединения из пула."""
+        if self._use_sqlite:
+            yield self._sqlite_conn
+            return
+        
         if not self._pool:
             await self.init_pool()
         
         async with self._pool.acquire() as conn:
             try:
-                async with async_timeout.timeout(config.REQUEST_TIMEOUT):
-                    yield conn
-            except asyncio.TimeoutError:
-                print(f"⚠️ Таймаут получения соединения из пула")
+                yield conn
+            except Exception as e:
+                logger.log_error(e)
                 raise
     
+    @retry_on_error(max_attempts=3)
     async def execute(self, query: str, *args):
         """Выполнение запроса без возврата результата."""
+        start_time = time()
         async with self.acquire() as conn:
-            return await conn.execute(query, *args)
+            result = await conn.execute(query, *args)
+            metrics.db_query_time.observe(time() - start_time)
+            return result
     
-    async def fetch(self, query: str, *args):
+    @retry_on_error(max_attempts=3)
+    async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
         """Выполнение запроса с возвратом списка строк."""
+        start_time = time()
         async with self.acquire() as conn:
-            return await conn.fetch(query, *args)
+            if self._use_sqlite:
+                cursor = await conn.execute(query, args)
+                return await cursor.fetchall()
+            result = await conn.fetch(query, *args)
+            metrics.db_query_time.observe(time() - start_time)
+            return result
     
-    async def fetchrow(self, query: str, *args):
+    @retry_on_error(max_attempts=3)
+    async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
         """Выполнение запроса с возвратом одной строки."""
+        start_time = time()
         async with self.acquire() as conn:
-            return await conn.fetchrow(query, *args)
+            if self._use_sqlite:
+                cursor = await conn.execute(query, args)
+                return await cursor.fetchone()
+            result = await conn.fetchrow(query, *args)
+            metrics.db_query_time.observe(time() - start_time)
+            return result
     
+    @retry_on_error(max_attempts=3)
     async def fetchval(self, query: str, *args):
         """Выполнение запроса с возвратом одного значения."""
+        start_time = time()
         async with self.acquire() as conn:
-            return await conn.fetchval(query, *args)
-    
-    @backoff.on_exception(
-        backoff.expo,
-        (asyncpg.exceptions.ConnectionDoesNotExistError, 
-         asyncpg.exceptions.InterfaceError),
-        max_tries=3
-    )
-    async def execute_with_retry(self, query: str, *args):
-        """Выполнение запроса с повторными попытками."""
-        return await self.execute(query, *args)
+            if self._use_sqlite:
+                cursor = await conn.execute(query, args)
+                row = await cursor.fetchone()
+                return row[0] if row else None
+            result = await conn.fetchval(query, *args)
+            metrics.db_query_time.observe(time() - start_time)
+            return result
 
 db = DatabaseManager()
 
 # ============== МЕНЕДЖЕР REDIS ==============
 
 class RedisManager:
-    """Менеджер Redis для кэширования и очередей."""
+    """Менеджер Redis для кэширования."""
     
     _instance = None
     _redis: Optional[Redis] = None
+    _enabled: bool = config.REDIS_ENABLED
     
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
     
-    async def get_connection(self) -> Redis:
+    async def get_connection(self) -> Optional[Redis]:
         """Получение подключения к Redis."""
+        if not self._enabled:
+            return None
+        
         if not self._redis:
-            self._redis = await redis.from_url(
-                config.REDIS_URL,
-                encoding="utf-8",
-                decode_responses=True,
-                max_connections=20
-            )
+            try:
+                self._redis = await redis.from_url(
+                    config.REDIS_URL,
+                    password=config.REDIS_PASSWORD or None,
+                    encoding="utf-8",
+                    decode_responses=True,
+                    max_connections=10
+                )
+                await self._redis.ping()
+                metrics.redis_connections.set(1)
+                print(f"✅ Redis подключен")
+            except Exception as e:
+                logger.log('warning', f"Redis не доступен: {e}")
+                self._enabled = False
+                metrics.redis_errors.inc()
+                return None
         return self._redis
     
     async def close(self):
@@ -274,907 +526,986 @@ class RedisManager:
         if self._redis:
             await self._redis.close()
             self._redis = None
+            metrics.redis_connections.set(0)
     
-    async def cache_get(self, key: str) -> Optional[str]:
+    async def get(self, key: str) -> Optional[str]:
         """Получение значения из кэша."""
         redis = await self.get_connection()
-        return await redis.get(key)
+        if not redis:
+            return None
+        try:
+            return await redis.get(key)
+        except Exception as e:
+            logger.log('warning', f"Redis get error: {e}")
+            metrics.redis_errors.inc()
+            return None
     
-    async def cache_set(self, key: str, value: str, ttl: int = config.CACHE_TTL):
+    async def set(self, key: str, value: str, ttl: int = config.CACHE_TTL):
         """Сохранение значения в кэш."""
         redis = await self.get_connection()
-        await redis.setex(key, ttl, value)
+        if not redis:
+            return
+        try:
+            await redis.setex(key, ttl, value)
+        except Exception as e:
+            logger.log('warning', f"Redis set error: {e}")
+            metrics.redis_errors.inc()
     
-    async def cache_delete(self, key: str):
+    async def delete(self, key: str):
         """Удаление из кэша."""
         redis = await self.get_connection()
-        await redis.delete(key)
-    
-    async def publish(self, channel: str, message: str):
-        """Публикация сообщения в канал."""
-        redis = await self.get_connection()
-        await redis.publish(channel, message)
-    
-    async def enqueue(self, queue: str, data: dict):
-        """Добавление задачи в очередь."""
-        redis = await self.get_connection()
-        await redis.rpush(queue, json.dumps(data))
+        if not redis:
+            return
+        try:
+            await redis.delete(key)
+        except Exception as e:
+            logger.log('warning', f"Redis delete error: {e}")
+            metrics.redis_errors.inc()
 
 redis_cache = RedisManager()
 
-# ============== ПЛАТЕЖНЫЙ МЕНЕДЖЕР ==============
+# ============== МОДЕЛИ ДАННЫХ ==============
 
-class PaymentManager:
-    """Менеджер платежей с поддержкой Telegram Stars и ЮKassa."""
+async def init_database():
+    """Инициализация таблиц в базе данных."""
     
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    @staticmethod
-    def get_plan_prices(plan: SubscriptionPlan) -> dict:
-        """Получение цен для тарифного плана."""
-        prices = {
-            SubscriptionPlan.PREMIUM: {
-                "monthly": {"stars": 100, "rub": 199},
-                "yearly": {"stars": 1000, "rub": 1990}
-            },
-            SubscriptionPlan.PROFESSIONAL: {
-                "monthly": {"stars": 500, "rub": 990},
-                "yearly": {"stars": 5000, "rub": 9900}
-            },
-            SubscriptionPlan.ENTERPRISE: {
-                "monthly": {"stars": 5000, "rub": 9990},
-                "yearly": {"stars": 50000, "rub": 99900}
-            }
-        }
-        return prices.get(plan, {})
-    
-    async def create_telegram_stars_invoice(
-        self,
-        bot,
-        user_id: int,
-        plan: SubscriptionPlan,
-        period: str = "monthly"
-    ) -> Optional[str]:
-        """Создание счета в Telegram Stars."""
-        if not config.TELEGRAM_PAYMENT_TOKEN:
-            return None
-        
-        prices = self.get_plan_prices(plan)
-        if not prices:
-            return None
-        
-        amount = prices[period]["stars"]
-        plan_names = {
-            SubscriptionPlan.PREMIUM: "Премиум",
-            SubscriptionPlan.PROFESSIONAL: "Профессиональный",
-            SubscriptionPlan.ENTERPRISE: "Корпоративный"
-        }
-        
-        period_text = "месяц" if period == "monthly" else "год"
-        
-        try:
-            invoice = await bot.create_invoice_link(
-                title=f"Подписка {plan_names[plan]}",
-                description=f"Доступ к расширенному функционалу на {period_text}",
-                payload=f"subscription_{user_id}_{plan.value}_{period}_{int(time())}",
-                provider_token=config.TELEGRAM_PAYMENT_TOKEN,
-                currency="XTR",
-                prices=[{"label": plan_names[plan], "amount": amount}],
-                subscription_period=2592000 if period == "monthly" else 31536000  # 30 или 365 дней
-            )
-            return invoice
-        except Exception as e:
-            print(f"❌ Ошибка создания счета: {e}")
-            return None
-    
-    async def create_yookassa_payment(
-        self,
-        user_id: int,
-        plan: SubscriptionPlan,
-        period: str = "monthly",
-        email: str = None
-    ) -> Optional[dict]:
-        """Создание платежа через ЮKassa."""
-        if not config.YOOKASSA_SHOP_ID or not config.YOOKASSA_SECRET_KEY:
-            return None
-        
-        prices = self.get_plan_prices(plan)
-        if not prices:
-            return None
-        
-        amount = prices[period]["rub"]
-        plan_names = {
-            SubscriptionPlan.PREMIUM: "Премиум",
-            SubscriptionPlan.PROFESSIONAL: "Профессиональный",
-            SubscriptionPlan.ENTERPRISE: "Корпоративный"
-        }
-        
-        period_text = "месяц" if period == "monthly" else "год"
-        
-        idempotence_key = str(uuid.uuid4())
-        payment_data = {
-            "amount": {
-                "value": f"{amount}.00",
-                "currency": "RUB"
-            },
-            "capture": True,
-            "confirmation": {
-                "type": "redirect",
-                "return_url": config.YOOKASSA_RETURN_URL
-            },
-            "description": f"Подписка {plan_names[plan]} на {period_text}",
-            "metadata": {
-                "user_id": user_id,
-                "plan": plan.value,
-                "period": period
-            },
-            "receipt": {
-                "customer": {
-                    "email": email or f"user_{user_id}@example.com"
-                },
-                "items": [{
-                    "description": f"Подписка {plan_names[plan]} на {period_text}",
-                    "quantity": "1.00",
-                    "amount": {
-                        "value": f"{amount}.00",
-                        "currency": "RUB"
-                    },
-                    "vat_code": 1,
-                    "payment_subject": "service",
-                    "payment_mode": "full_prepayment"
-                }]
-            }
-        }
-        
-        auth = aiohttp.BasicAuth(
-            config.YOOKASSA_SHOP_ID,
-            config.YOOKASSA_SECRET_KEY
+    # Таблица пользователей
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT UNIQUE NOT NULL,
+            username VARCHAR(100),
+            first_name VARCHAR(100),
+            last_name VARCHAR(100),
+            language VARCHAR(10) DEFAULT 'ru',
+            timezone VARCHAR(50) DEFAULT 'Europe/Moscow',
+            role VARCHAR(20) DEFAULT 'user',
+            status VARCHAR(20) DEFAULT 'active',
+            has_seen_welcome BOOLEAN DEFAULT FALSE,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_interactions INTEGER DEFAULT 0,
+            notifications_enabled BOOLEAN DEFAULT TRUE,
+            notification_offset INTEGER DEFAULT 5,
+            user_metadata JSONB DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.yookassa.ru/v3/payments",
-                    json=payment_data,
-                    auth=auth,
-                    headers={
-                        "Idempotence-Key": idempotence_key,
-                        "Content-Type": "application/json"
-                    }
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        return {
-                            "id": result["id"],
-                            "confirmation_url": result["confirmation"]["confirmation_url"],
-                            "amount": amount
-                        }
-        except Exception as e:
-            print(f"❌ Ошибка создания платежа ЮKassa: {e}")
-        
-        return None
-
-payments = PaymentManager()
-
-# ============== МЕНЕДЖЕР ПОДПИСОК ==============
-
-class SubscriptionManager:
-    """Менеджер подписок и прав доступа."""
+    """)
     
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    async def init_tables(self):
-        """Инициализация таблиц для подписок."""
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS tenants (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(200) NOT NULL,
-                slug VARCHAR(50) UNIQUE NOT NULL,
-                admin_id BIGINT UNIQUE,
-                settings JSONB DEFAULT '{}',
-                branding JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS subscription_plans (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                code VARCHAR(50) UNIQUE NOT NULL,
-                price_monthly_stars INTEGER,
-                price_yearly_stars INTEGER,
-                price_monthly_rub DECIMAL(10,2),
-                price_yearly_rub DECIMAL(10,2),
-                features JSONB NOT NULL,
-                max_patients INTEGER,
-                max_doctors INTEGER,
-                has_analytics BOOLEAN DEFAULT FALSE,
-                has_export BOOLEAN DEFAULT FALSE,
-                has_api BOOLEAN DEFAULT FALSE,
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_subscriptions (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tenant_id INTEGER REFERENCES tenants(id),
-                plan_code VARCHAR(50) NOT NULL,
-                status VARCHAR(50) NOT NULL,
-                started_at TIMESTAMP NOT NULL,
-                expires_at TIMESTAMP,
-                auto_renew BOOLEAN DEFAULT TRUE,
-                payment_method VARCHAR(50),
-                payment_id VARCHAR(200),
-                metadata JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_user_subscriptions_user (user_id),
-                INDEX idx_user_subscriptions_status (status)
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tenant_id INTEGER REFERENCES tenants(id),
-                amount DECIMAL(10,2) NOT NULL,
-                currency VARCHAR(10) NOT NULL,
-                payment_method VARCHAR(50) NOT NULL,
-                payment_system VARCHAR(50) NOT NULL,
-                payment_id VARCHAR(200) UNIQUE,
-                status VARCHAR(50) NOT NULL,
-                description TEXT,
-                metadata JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_payments_user (user_id),
-                INDEX idx_payments_status (status)
-            )
-        """)
-        
-        # Инициализация тарифных планов
-        await self.init_default_plans()
-    
-    async def init_default_plans(self):
-        """Создание тарифных планов по умолчанию."""
-        plans = [
-            {
-                "code": "free",
-                "name": "Бесплатный",
-                "features": {
-                    "max_medicines": 3,
-                    "max_analyses": 3,
-                    "has_stats": True,
-                    "has_export": False,
-                    "has_analytics": False
-                },
-                "max_patients": 1,
-                "max_doctors": 0,
-                "has_analytics": False,
-                "has_export": False,
-                "has_api": False
-            },
-            {
-                "code": "premium",
-                "name": "Премиум",
-                "price_monthly_stars": 100,
-                "price_yearly_stars": 1000,
-                "price_monthly_rub": 199,
-                "price_yearly_rub": 1990,
-                "features": {
-                    "max_medicines": 100,
-                    "max_analyses": 100,
-                    "has_stats": True,
-                    "has_export": True,
-                    "has_analytics": True
-                },
-                "max_patients": 1,
-                "max_doctors": 0,
-                "has_analytics": True,
-                "has_export": True,
-                "has_api": False
-            },
-            {
-                "code": "professional",
-                "name": "Профессиональный",
-                "price_monthly_stars": 500,
-                "price_yearly_stars": 5000,
-                "price_monthly_rub": 990,
-                "price_yearly_rub": 9900,
-                "features": {
-                    "max_medicines": 1000,
-                    "max_analyses": 1000,
-                    "has_stats": True,
-                    "has_export": True,
-                    "has_analytics": True
-                },
-                "max_patients": 50,
-                "max_doctors": 5,
-                "has_analytics": True,
-                "has_export": True,
-                "has_api": True
-            },
-            {
-                "code": "enterprise",
-                "name": "Корпоративный",
-                "price_monthly_stars": 5000,
-                "price_yearly_stars": 50000,
-                "price_monthly_rub": 9990,
-                "price_yearly_rub": 99900,
-                "features": {
-                    "max_medicines": 10000,
-                    "max_analyses": 10000,
-                    "has_stats": True,
-                    "has_export": True,
-                    "has_analytics": True
-                },
-                "max_patients": 1000,
-                "max_doctors": 50,
-                "has_analytics": True,
-                "has_export": True,
-                "has_api": True
-            }
-        ]
-        
-        for plan in plans:
-            await db.execute("""
-                INSERT INTO subscription_plans (
-                    code, name, price_monthly_stars, price_yearly_stars,
-                    price_monthly_rub, price_yearly_rub, features,
-                    max_patients, max_doctors, has_analytics, has_export, has_api
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ON CONFLICT (code) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    price_monthly_stars = EXCLUDED.price_monthly_stars,
-                    price_yearly_stars = EXCLUDED.price_yearly_stars,
-                    price_monthly_rub = EXCLUDED.price_monthly_rub,
-                    price_yearly_rub = EXCLUDED.price_yearly_rub,
-                    features = EXCLUDED.features,
-                    max_patients = EXCLUDED.max_patients,
-                    max_doctors = EXCLUDED.max_doctors,
-                    has_analytics = EXCLUDED.has_analytics,
-                    has_export = EXCLUDED.has_export,
-                    has_api = EXCLUDED.has_api
-            """, 
-                plan["code"], plan["name"],
-                plan.get("price_monthly_stars"), plan.get("price_yearly_stars"),
-                plan.get("price_monthly_rub"), plan.get("price_yearly_rub"),
-                json.dumps(plan["features"]),
-                plan["max_patients"], plan["max_doctors"],
-                plan["has_analytics"], plan["has_export"], plan["has_api"]
-            )
-    
-    async def create_tenant(
-        self,
-        name: str,
-        admin_id: int,
-        settings: dict = None,
-        branding: dict = None
-    ) -> int:
-        """Создание нового арендатора (клиники/врача)."""
-        slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
-        
-        # Убеждаемся, что slug уникален
-        base_slug = slug
-        counter = 1
-        while True:
-            existing = await db.fetchval(
-                "SELECT id FROM tenants WHERE slug = $1",
-                slug
-            )
-            if not existing:
-                break
-            slug = f"{base_slug}-{counter}"
-            counter += 1
-        
-        tenant_id = await db.fetchval("""
-            INSERT INTO tenants (name, slug, admin_id, settings, branding)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-        """, name, slug, admin_id, 
-            json.dumps(settings or {}),
-            json.dumps(branding or {})
+    # Таблица лекарств
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS medicines (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            name VARCHAR(200) NOT NULL,
+            dosage VARCHAR(100),
+            times_per_day INTEGER DEFAULT 1,
+            schedule_times JSONB,
+            schedule VARCHAR(200),
+            course_type VARCHAR(20) DEFAULT 'unlimited',
+            course_duration INTEGER,
+            repeat_type VARCHAR(20) DEFAULT 'none',
+            repeat_interval INTEGER,
+            start_date TIMESTAMP,
+            end_date TIMESTAMP,
+            user_timezone VARCHAR(50) NOT NULL,
+            status VARCHAR(20) DEFAULT 'active',
+            total_taken INTEGER DEFAULT 0,
+            total_skipped INTEGER DEFAULT 0,
+            total_postponed INTEGER DEFAULT 0,
+            total_unscheduled INTEGER DEFAULT 0,
+            stats JSONB DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        
-        # Создаем бесплатную подписку для администратора
-        await self.create_subscription(
-            user_id=admin_id,
-            tenant_id=tenant_id,
-            plan_code="free",
-            status=SubscriptionStatus.ACTIVE,
-            auto_renew=False
+    """)
+    
+    # Таблица логов лекарств
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS medicine_logs (
+            id SERIAL PRIMARY KEY,
+            medicine_id INTEGER NOT NULL,
+            user_id BIGINT NOT NULL,
+            log_type VARCHAR(20) DEFAULT 'scheduled',
+            status VARCHAR(20),
+            dosage VARCHAR(100),
+            reason TEXT,
+            comment TEXT,
+            side_effects TEXT,
+            scheduled_time TIMESTAMP,
+            taken_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        
-        metrics.tenant_count.inc()
-        return tenant_id
+    """)
     
-    async def get_tenant(self, tenant_id: int) -> Optional[dict]:
-        """Получение информации об арендаторе."""
-        return await db.fetchrow(
-            "SELECT * FROM tenants WHERE id = $1",
-            tenant_id
+    # Таблица анализов
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS analyses (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            analysis_type VARCHAR(20) DEFAULT 'analysis',
+            name VARCHAR(200) NOT NULL,
+            scheduled_date TIMESTAMP NOT NULL,
+            scheduled_time VARCHAR(10) NOT NULL,
+            repeat_type VARCHAR(20) DEFAULT 'once',
+            repeat_interval INTEGER,
+            reminder_before INTEGER DEFAULT 24,
+            notes TEXT,
+            status VARCHAR(20) DEFAULT 'pending',
+            user_timezone VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
     
-    async def get_tenant_by_admin(self, admin_id: int) -> Optional[dict]:
-        """Получение арендатора по ID администратора."""
-        return await db.fetchrow(
-            "SELECT * FROM tenants WHERE admin_id = $1",
-            admin_id
+    # Таблица настроения
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mood_logs (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            mood_score INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
     
-    async def get_user_tenant(self, user_id: int) -> Optional[dict]:
-        """Получение арендатора для пользователя."""
-        # Сначала проверяем, не является ли пользователь администратором
-        tenant = await self.get_tenant_by_admin(user_id)
-        if tenant:
-            return tenant
-        
-        # Ищем подписку пользователя
-        sub = await db.fetchrow("""
-            SELECT t.* FROM tenants t
-            JOIN user_subscriptions us ON us.tenant_id = t.id
-            WHERE us.user_id = $1 AND us.status = $2
-            LIMIT 1
-        """, user_id, SubscriptionStatus.ACTIVE.value)
-        
-        return sub
-    
-    async def create_subscription(
-        self,
-        user_id: int,
-        tenant_id: Optional[int],
-        plan_code: str,
-        status: SubscriptionStatus = SubscriptionStatus.ACTIVE,
-        duration_days: int = 30,
-        auto_renew: bool = True,
-        payment_method: str = None,
-        payment_id: str = None,
-        metadata: dict = None
-    ) -> int:
-        """Создание подписки для пользователя."""
-        now = datetime.utcnow()
-        expires_at = now + timedelta(days=duration_days) if duration_days else None
-        
-        # Деактивируем предыдущие активные подписки
-        await db.execute("""
-            UPDATE user_subscriptions
-            SET status = $1, updated_at = NOW()
-            WHERE user_id = $2 AND status = $3
-        """, SubscriptionStatus.EXPIRED.value, user_id, SubscriptionStatus.ACTIVE.value)
-        
-        sub_id = await db.fetchval("""
-            INSERT INTO user_subscriptions (
-                user_id, tenant_id, plan_code, status,
-                started_at, expires_at, auto_renew,
-                payment_method, payment_id, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id
-        """,
-            user_id, tenant_id, plan_code, status.value,
-            now, expires_at, auto_renew,
-            payment_method, payment_id, json.dumps(metadata or {})
+    # Таблица симптомов
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS symptom_logs (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            symptom VARCHAR(100) NOT NULL,
+            severity INTEGER NOT NULL,
+            severity_color VARCHAR(20),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        
-        # Обновляем метрики
-        metrics.subscriptions.labels(plan=plan_code, action="created").inc()
-        
-        # Если это платный план, обновляем счетчик платных пользователей
-        if plan_code != "free":
-            metrics.paid_users.labels(plan=plan_code).inc()
-        
-        return sub_id
+    """)
     
-    async def get_user_subscription(self, user_id: int) -> Optional[dict]:
-        """Получение активной подписки пользователя."""
-        sub = await db.fetchrow("""
-            SELECT us.*, sp.*
-            FROM user_subscriptions us
-            JOIN subscription_plans sp ON sp.code = us.plan_code
-            WHERE us.user_id = $1
-                AND us.status = $2
-                AND (us.expires_at IS NULL OR us.expires_at > NOW())
-            ORDER BY us.created_at DESC
-            LIMIT 1
-        """, user_id, SubscriptionStatus.ACTIVE.value)
-        
-        return sub
-    
-    async def check_feature_access(
-        self,
-        user_id: int,
-        feature: str,
-        default_value: Any = None
-    ) -> bool:
-        """Проверка доступа к функции на основе подписки."""
-        # Проверка кэша
-        cache_key = f"feature:{user_id}:{feature}"
-        cached = await redis_cache.cache_get(cache_key)
-        if cached is not None:
-            return cached == "true"
-        
-        sub = await self.get_user_subscription(user_id)
-        
-        if not sub:
-            # Бесплатный доступ по умолчанию
-            if feature in ["max_medicines", "max_analyses"]:
-                await redis_cache.cache_set(cache_key, "true" if 3 > 0 else "false", 300)
-                return True
-            return False
-        
-        features = sub.get("features", {})
-        has_access = features.get(feature, False)
-        
-        # Проверка лимитов
-        if feature == "max_medicines":
-            limit = features.get("max_medicines", 0)
-            if limit > 0:
-                # Считаем текущее количество лекарств
-                count = await db.fetchval(
-                    "SELECT COUNT(*) FROM medicines WHERE user_id = $1 AND status = 'active'",
-                    user_id
-                )
-                has_access = count < limit
-        
-        await redis_cache.cache_set(cache_key, str(has_access).lower(), 300)
-        return has_access
-    
-    async def check_rate_limit(self, user_id: int, resource: str, limit: int = 100) -> bool:
-        """Проверка лимитов скорости."""
-        key = f"ratelimit:{user_id}:{resource}"
-        redis = await redis_cache.get_connection()
-        
-        current = await redis.incr(key)
-        if current == 1:
-            await redis.expire(key, 60)  # 1 минута
-        
-        return current <= limit
-    
-    async def log_payment(
-        self,
-        user_id: int,
-        tenant_id: Optional[int],
-        amount: float,
-        currency: str,
-        payment_method: str,
-        payment_system: str,
-        payment_id: str,
-        status: PaymentStatus,
-        description: str = None,
-        metadata: dict = None
-    ) -> int:
-        """Логирование платежа."""
-        payment_db_id = await db.fetchval("""
-            INSERT INTO payments (
-                user_id, tenant_id, amount, currency,
-                payment_method, payment_system, payment_id,
-                status, description, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id
-        """,
-            user_id, tenant_id, amount, currency,
-            payment_method, payment_system, payment_id,
-            status.value, description, json.dumps(metadata or {})
+    # Таблица напоминаний
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            reminder_type VARCHAR(20),
+            item_id INTEGER NOT NULL,
+            scheduled_time TIMESTAMP NOT NULL,
+            user_timezone VARCHAR(50) NOT NULL,
+            status VARCHAR(20) DEFAULT 'pending',
+            retry_count INTEGER DEFAULT 0,
+            last_error TEXT,
+            postponed_until TIMESTAMP,
+            pause_until TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        
-        if status == PaymentStatus.SUCCEEDED:
-            metrics.revenue.labels(
-                plan=metadata.get("plan", "unknown"),
-                currency=currency
-            ).inc(amount)
-        
-        return payment_db_id
-
-subscriptions = SubscriptionManager()
-
-# ============== БРЕНДИРОВАНИЕ ==============
-
-class BrandingManager:
-    """Менеджер брендирования для клиник."""
+    """)
     
-    _instance = None
-    _brand_cache = {}
+    # Таблица логов администратора
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id SERIAL PRIMARY KEY,
+            admin_id BIGINT NOT NULL,
+            action VARCHAR(100) NOT NULL,
+            target_user_id BIGINT,
+            details JSONB,
+            ip_address VARCHAR(50),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    # Создание индексов для производительности
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_medicines_user_id ON medicines(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_medicines_status ON medicines(status)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_scheduled_time ON reminders(scheduled_time)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_user_id ON mood_logs(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_symptom_logs_user_id ON symptom_logs(user_id)")
     
-    async def get_branding(self, tenant_id: Optional[int]) -> dict:
-        """Получение настроек бренда для арендатора."""
-        if not tenant_id:
-            return self.get_default_branding()
-        
-        # Проверка кэша
-        if tenant_id in self._brand_cache:
-            return self._brand_cache[tenant_id]
-        
-        tenant = await subscriptions.get_tenant(tenant_id)
-        if not tenant:
-            return self.get_default_branding()
-        
-        branding = tenant.get("branding", {})
-        self._brand_cache[tenant_id] = branding
-        return branding
-    
-    def get_default_branding(self) -> dict:
-        """Настройки бренда по умолчанию."""
-        return {
-            "name": "ЛОР-Помощник",
-            "description": "Персональный медицинский бот",
-            "doctor_name": "Денис Казарин",
-            "doctor_title": "врач-оториноларинголог",
-            "welcome_text": "👋 *Здравствуйте!*\n\nЯ помогу вам следить за приемом лекарств и самочувствием.",
-            "colors": {
-                "primary": "#2A9D8F",
-                "secondary": "#E9C46A"
-            }
-        }
-    
-    async def format_welcome_message(
-        self,
-        tenant_id: Optional[int],
-        user_first_name: str
-    ) -> str:
-        """Форматирование приветственного сообщения с учетом бренда."""
-        branding = await self.get_branding(tenant_id)
-        
-        text = f"""👋 *Здравствуйте, {user_first_name}!*
-
-Я *{branding['name']}* — персональный медицинский бот.
-
-👨‍⚕️ *О враче:* {branding['doctor_name']}, {branding['doctor_title']}
-
-*Мои возможности:*
-• 💊 Напоминания о приеме лекарств
-• 🩺 Напоминания об анализах
-• 📊 Отслеживание самочувствия
-• 📈 Статистика и отчеты"""
-        
-        return text
-
-branding = BrandingManager()
+    print("✅ Таблицы базы данных инициализированы")
 
 # ============== БЕЗОПАСНОСТЬ ==============
 
 class SecurityManager:
-    """Менеджер безопасности для коммерческого продукта."""
+    """Менеджер безопасности."""
+    
+    _VALID_TIMEZONES = set(pytz.all_timezones)
+    _user_action_tracker = defaultdict(list)
     
     @staticmethod
-    def generate_api_key(tenant_id: int) -> str:
-        """Генерация API ключа для арендатора."""
-        random_part = secrets.token_urlsafe(32)
-        hash_part = hashlib.sha256(f"{tenant_id}:{random_part}".encode()).hexdigest()[:16]
-        return f"lk_{tenant_id}_{random_part}_{hash_part}"
+    def sanitize_input(text: str, max_length: int = 1000) -> str:
+        """Санитизация пользовательского ввода."""
+        if not text:
+            return text
+        if len(text) > max_length:
+            text = text[:max_length]
+        return ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
     
     @staticmethod
-    def verify_webhook_signature(payload: bytes, signature: str, secret: str) -> bool:
-        """Проверка подписи webhook."""
-        if not secret:
+    def validate_medicine_name(name: str) -> Tuple[bool, str]:
+        """Валидация названия лекарства."""
+        if len(name) < 2:
+            return False, "Слишком короткое название (мин. 2 символа)"
+        if len(name) > 200:
+            return False, "Слишком длинное название (макс. 200 символов)"
+        if not re.match(r'^[а-яА-Яa-zA-Z0-9\s\-]+$', name):
+            return False, "Название может содержать только буквы, цифры, пробелы и дефисы"
+        return True, "OK"
+    
+    @staticmethod
+    def validate_number_input(text: str, min_val: int, max_val: int) -> Tuple[bool, int, str]:
+        """Валидация числового ввода."""
+        try:
+            value = int(text.strip())
+            if min_val <= value <= max_val:
+                return True, value, "OK"
+            return False, 0, f"Число должно быть от {min_val} до {max_val}"
+        except ValueError:
+            return False, 0, "Введите целое число"
+    
+    @staticmethod
+    def check_sql_injection(text: str) -> bool:
+        """Проверка на SQL-инъекции."""
+        if not text:
             return False
-        expected = hmac.new(
-            secret.encode(),
-            payload,
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(expected, signature)
+        dangerous = ['select', 'insert', 'update', 'delete', 'drop', 'union', '--', ';']
+        text_lower = text.lower()
+        for pattern in dangerous:
+            if pattern in text_lower:
+                logger.log('security', f"Potential SQL injection detected", text=text[:100])
+                return True
+        return False
     
     @staticmethod
-    async def check_tenant_access(user_id: int, tenant_id: int) -> bool:
-        """Проверка доступа пользователя к арендатору."""
-        # Платформенные администраторы имеют доступ ко всему
-        if user_id in config.PLATFORM_ADMIN_IDS:
-            return True
-        
-        # Проверяем, является ли пользователь администратором арендатора
-        tenant = await subscriptions.get_tenant_by_admin(user_id)
-        if tenant and tenant["id"] == tenant_id:
-            return True
-        
-        # Проверяем подписку пользователя
-        sub = await subscriptions.get_user_subscription(user_id)
-        return sub and sub["tenant_id"] == tenant_id
-
-# ============== МОДЕЛИ ДАННЫХ ПОЛЬЗОВАТЕЛЕЙ ==============
-
-class UserTables:
-    """Менеджер таблиц пользовательских данных."""
+    def validate_callback_data(data: str) -> bool:
+        """Валидация callback data."""
+        if not data or len(data) > config.MAX_CALLBACK_DATA_LENGTH:
+            return False
+        return bool(re.match(r'^[a-zA-Z0-9_\-]+$', data))
     
     @staticmethod
-    async def init_tables():
-        """Инициализация таблиц для пользовательских данных."""
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tenant_id INTEGER REFERENCES tenants(id),
-                username VARCHAR(100),
-                first_name VARCHAR(100),
-                last_name VARCHAR(100),
-                language VARCHAR(10) DEFAULT 'ru',
-                timezone VARCHAR(50) DEFAULT 'Europe/Moscow',
-                role VARCHAR(50) DEFAULT 'patient',
-                status VARCHAR(50) DEFAULT 'active',
-                has_seen_welcome BOOLEAN DEFAULT FALSE,
-                first_seen TIMESTAMP DEFAULT NOW(),
-                last_seen TIMESTAMP DEFAULT NOW(),
-                total_interactions INTEGER DEFAULT 0,
-                metadata JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                UNIQUE(user_id, tenant_id),
-                INDEX idx_users_user (user_id),
-                INDEX idx_users_tenant (tenant_id),
-                INDEX idx_users_role (role)
-            )
-        """)
+    def validate_timezone(tz_name: str) -> bool:
+        """Валидация часового пояса."""
+        return tz_name in SecurityManager._VALID_TIMEZONES
+    
+    @staticmethod
+    def check_double_click(user_id: int, action: str) -> bool:
+        """Проверка на двойные нажатия."""
+        key = f"{user_id}:{action}"
+        current_time = time()
         
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS medicines (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tenant_id INTEGER REFERENCES tenants(id),
-                name VARCHAR(200) NOT NULL,
-                dosage VARCHAR(100),
-                times_per_day INTEGER DEFAULT 1,
-                schedule_times JSONB,
-                schedule VARCHAR(200),
-                course_duration INTEGER,
-                repeat_type VARCHAR(20) DEFAULT 'none',
-                repeat_interval INTEGER,
-                start_date TIMESTAMP,
-                user_timezone VARCHAR(50) NOT NULL,
-                status VARCHAR(20) DEFAULT 'active',
-                total_taken INTEGER DEFAULT 0,
-                total_skipped INTEGER DEFAULT 0,
-                total_postponed INTEGER DEFAULT 0,
-                total_unscheduled INTEGER DEFAULT 0,
-                stats JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_medicines_user (user_id),
-                INDEX idx_medicines_tenant (tenant_id),
-                INDEX idx_medicines_status (status)
-            )
-        """)
+        if key in SecurityManager._user_action_tracker:
+            last_time = SecurityManager._user_action_tracker[key][-1] if SecurityManager._user_action_tracker[key] else 0
+            if current_time - last_time < config.DOUBLE_CLICK_INTERVAL:
+                return True
         
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS analyses (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                tenant_id INTEGER REFERENCES tenants(id),
-                name VARCHAR(200) NOT NULL,
-                scheduled_date TIMESTAMP NOT NULL,
-                scheduled_time VARCHAR(10) NOT NULL,
-                repeat_type VARCHAR(20) DEFAULT 'once',
-                repeat_interval INTEGER,
-                reminder_before INTEGER DEFAULT 24,
-                notes TEXT,
-                status VARCHAR(20) DEFAULT 'pending',
-                user_timezone VARCHAR(50) NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                INDEX idx_analyses_user (user_id),
-                INDEX idx_analyses_tenant (tenant_id),
-                INDEX idx_analyses_status (status)
-            )
-        """)
+        SecurityManager._user_action_tracker[key].append(current_time)
+        SecurityManager._user_action_tracker[key] = [
+            t for t in SecurityManager._user_action_tracker[key] 
+            if current_time - t < 60
+        ]
+        return False
+    
+    @staticmethod
+    def audit_log(action: str, user_id: int, details: dict = None):
+        """Логирование действий для аудита."""
+        logger.log('audit', f"Action: {action}", user_id=user_id, **(details or {}))
 
-# ============== ОСНОВНОЙ КЛАСС БОТА ==============
+# ============== УТИЛИТЫ ДЛЯ ВРЕМЕНИ ==============
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ConversationHandler, MessageHandler, filters, ContextTypes,
-    PreCheckoutQueryHandler, ShippingQueryHandler
-)
-from telegram.constants import ParseMode
+class TimeUtils:
+    """Утилиты для работы со временем."""
+    
+    _tz_cache = {}
+    
+    @classmethod
+    def get_timezone(cls, tz_name: str) -> pytz.timezone:
+        """Получение объекта часового пояса."""
+        if not SecurityManager.validate_timezone(tz_name):
+            tz_name = 'Europe/Moscow'
+        
+        if tz_name not in cls._tz_cache:
+            cls._tz_cache[tz_name] = pytz.timezone(tz_name)
+        return cls._tz_cache[tz_name]
+    
+    @classmethod
+    async def get_user_timezone(cls, user_id: int) -> str:
+        """Получение часового пояса пользователя с кэшированием."""
+        # Проверяем кэш
+        cached = await redis_cache.get(f"tz:{user_id}")
+        if cached:
+            return cached
+        
+        # Запрашиваем из БД
+        tz = await db.fetchval(
+            "SELECT timezone FROM users WHERE user_id = $1",
+            user_id
+        )
+        tz = tz or 'Europe/Moscow'
+        
+        # Сохраняем в кэш
+        await redis_cache.set(f"tz:{user_id}", tz, 3600)
+        return tz
+    
+    @classmethod
+    async def set_user_timezone(cls, user_id: int, timezone: str):
+        """Установка часового пояса пользователя."""
+        await db.execute(
+            "UPDATE users SET timezone = $1, updated_at = CURRENT_TIMESTAMP WHERE user_id = $2",
+            timezone, user_id
+        )
+        await redis_cache.delete(f"tz:{user_id}")
+    
+    @classmethod
+    def local_to_utc(cls, local_time_str: str, timezone: str, base_date: Optional[datetime] = None) -> datetime:
+        """Конвертация локального времени в UTC."""
+        if base_date is None:
+            base_date = datetime.now(cls.get_timezone(timezone))
+        
+        hour, minute = map(int, local_time_str.split(':'))
+        local_dt = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        
+        if local_dt.tzinfo is None:
+            tz = cls.get_timezone(timezone)
+            local_dt = tz.localize(local_dt)
+        
+        return local_dt.astimezone(pytz.UTC)
+    
+    @classmethod
+    def utc_to_local(cls, utc_dt: datetime, timezone: str) -> datetime:
+        """Конвертация UTC в локальное время."""
+        if utc_dt.tzinfo is None:
+            utc_dt = pytz.UTC.localize(utc_dt)
+        tz = cls.get_timezone(timezone)
+        return utc_dt.astimezone(tz)
+    
+    @classmethod
+    def parse_date(cls, date_str: str, timezone: str) -> Optional[datetime]:
+        """Парсинг даты из строки."""
+        try:
+            formats = ['%d.%m.%Y', '%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d']
+            for fmt in formats:
+                try:
+                    dt = datetime.strptime(date_str, fmt)
+                    dt = dt.replace(hour=12, minute=0, second=0)
+                    tz = cls.get_timezone(timezone)
+                    return tz.localize(dt)
+                except ValueError:
+                    continue
+            return None
+        except:
+            return None
 
-class States:
-    """Состояния для диалогов."""
-    MAIN_MENU = 0
-    SELECT_PLAN = 1
-    SELECT_PERIOD = 2
-    PAYMENT_METHOD = 3
-    PROCESS_PAYMENT = 4
-    ADD_MEDICINE = 10
-    ADD_ANALYSIS = 20
-    TENANT_SETUP = 30
-    BRANDING_SETUP = 31
+# ============== RATE LIMITER ==============
 
-class LorBot:
-    """Основной класс коммерческого бота."""
+class RateLimiter:
+    """Rate limiter для защиты от превышения лимитов Telegram."""
     
     def __init__(self):
-        self.app = None
+        self.user_last_message = defaultdict(float)
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self, user_id: Optional[int] = None):
+        """Acquire rate limit permit."""
+        if user_id:
+            async with self._lock:
+                now = time()
+                last_msg = self.user_last_message[user_id]
+                if now - last_msg < config.RATE_LIMIT_USER:
+                    wait_time = config.RATE_LIMIT_USER - (now - last_msg)
+                    await asyncio.sleep(wait_time)
+                self.user_last_message[user_id] = now
+
+rate_limiter = RateLimiter()
+
+# ============== ПЛАНИРОВЩИК ==============
+
+class SchedulerManager:
+    """Менеджер планировщика."""
+    
+    def __init__(self):
+        jobstores = {
+            'default': SQLAlchemyJobStore(url='sqlite:///apscheduler_jobs.db')
+        }
+        executors = {
+            'default': AsyncIOExecutor()
+        }
+        job_defaults = {
+            'coalesce': True,
+            'max_instances': 10,
+            'misfire_grace_time': 3600
+        }
+        
+        self.scheduler = AsyncIOScheduler(
+            jobstores=jobstores,
+            executors=executors,
+            job_defaults=job_defaults,
+            timezone=pytz.UTC
+        )
+        self.application = None
+        self._running = False
+    
+    def set_application(self, app):
+        self.application = app
+    
+    def start(self):
+        if not self._running:
+            self.scheduler.start()
+            self._running = True
+            logger.log('info', "Планировщик запущен")
+    
+    def shutdown(self):
+        if self._running:
+            self.scheduler.shutdown()
+            self._running = False
+            logger.log('info', "Планировщик остановлен")
+    
+    async def restore_reminders(self):
+        """Восстановление напоминаний при старте."""
+        reminders = await db.fetch("""
+            SELECT * FROM reminders 
+            WHERE status = 'pending' AND scheduled_time > CURRENT_TIMESTAMP
+        """)
+        
+        restored = 0
+        for reminder in reminders:
+            job_id = f"{reminder['reminder_type']}_{reminder['id']}"
+            
+            try:
+                self.scheduler.remove_job(job_id)
+            except JobLookupError:
+                pass
+            
+            self.scheduler.add_job(
+                self.send_reminder,
+                trigger=DateTrigger(run_date=reminder['scheduled_time']),
+                id=job_id,
+                args=[reminder['id']],
+                replace_existing=True
+            )
+            restored += 1
+        
+        logger.log('info', f"Восстановлено {restored} напоминаний")
+        return restored
+    
+    async def send_reminder(self, reminder_id: int):
+        """Отправка напоминания."""
+        if not self.application:
+            return
+        
+        try:
+            reminder = await db.fetchrow(
+                "SELECT * FROM reminders WHERE id = $1",
+                reminder_id
+            )
+            
+            if not reminder or reminder['status'] != 'pending':
+                return
+            
+            user_id = reminder['user_id']
+            
+            if reminder['reminder_type'] == 'medicine':
+                medicine = await db.fetchrow(
+                    "SELECT * FROM medicines WHERE id = $1",
+                    reminder['item_id']
+                )
+                
+                if not medicine or medicine['status'] != 'active':
+                    await db.execute(
+                        "UPDATE reminders SET status = 'cancelled' WHERE id = $1",
+                        reminder_id
+                    )
+                    return
+                
+                text = f"💊 *Время принять лекарство!*\n\n{medicine['name']}"
+                if medicine['dosage']:
+                    text += f"\n💧 Дозировка: {medicine['dosage']}"
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Принял(а)", callback_data=f"take_{medicine['id']}"),
+                        InlineKeyboardButton("⏸ Отложить", callback_data=f"postpone_medicine_{medicine['id']}")
+                    ],
+                    [
+                        InlineKeyboardButton("📝 Комментарий", callback_data=f"comment_medicine_{medicine['id']}"),
+                        InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_medicine_{medicine['id']}")
+                    ],
+                    [
+                        InlineKeyboardButton("🆕 Новый симптом", callback_data=f"new_symptom_{medicine['id']}"),
+                        InlineKeyboardButton("⚠️ Побочное действие", callback_data=f"side_effect_{medicine['id']}")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+            elif reminder['reminder_type'] == 'analysis':
+                analysis = await db.fetchrow(
+                    "SELECT * FROM analyses WHERE id = $1",
+                    reminder['item_id']
+                )
+                
+                if not analysis or analysis['status'] != 'pending':
+                    await db.execute(
+                        "UPDATE reminders SET status = 'cancelled' WHERE id = $1",
+                        reminder_id
+                    )
+                    return
+                
+                local_date = TimeUtils.utc_to_local(
+                    analysis['scheduled_date'], 
+                    analysis['user_timezone']
+                )
+                
+                text = f"🩺 *Напоминание об анализе!*\n\n"
+                text += f"📋 {analysis['name']}\n"
+                text += f"📅 {local_date.strftime('%d.%m.%Y')} в {analysis['scheduled_time']}\n"
+                
+                if analysis['notes']:
+                    text += f"\n📝 *Заметки:* {analysis['notes']}"
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Сдал(а)", callback_data=f"analysis_take_{analysis['id']}"),
+                        InlineKeyboardButton("⏸ Отложить", callback_data=f"postpone_analysis_{analysis['id']}")
+                    ],
+                    [
+                        InlineKeyboardButton("📝 Заметки", callback_data=f"analysis_notes_{analysis['id']}"),
+                        InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_analysis_{analysis['id']}")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+            else:
+                return
+            
+            for attempt in range(config.REMINDER_RETRY_COUNT):
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=user_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    await db.execute(
+                        "UPDATE reminders SET status = 'sent', retry_count = $1 WHERE id = $2",
+                        attempt + 1, reminder_id
+                    )
+                    return
+                    
+                except (RetryAfter, TimedOut) as e:
+                    if attempt < config.REMINDER_RETRY_COUNT - 1:
+                        await asyncio.sleep(5 * (attempt + 1))
+                    await db.execute(
+                        "UPDATE reminders SET retry_count = $1, last_error = $2 WHERE id = $3",
+                        attempt + 1, str(e), reminder_id
+                    )
+                
+                except Forbidden:
+                    await db.execute(
+                        "UPDATE reminders SET status = 'failed', last_error = 'User blocked bot' WHERE id = $1",
+                        reminder_id
+                    )
+                    return
+                
+                except Exception as e:
+                    logger.log_error(e, {'reminder_id': reminder_id})
+                    await db.execute(
+                        "UPDATE reminders SET status = 'failed', last_error = $1 WHERE id = $2",
+                        str(e), reminder_id
+                    )
+                    return
+            
+            await db.execute(
+                "UPDATE reminders SET status = 'failed' WHERE id = $1",
+                reminder_id
+            )
+            
+        except Exception as e:
+            logger.log_error(e, {'reminder_id': reminder_id})
+
+scheduler = SchedulerManager()
+
+# ============== СОСТОЯНИЯ ==============
+
+class States:
+    """Состояния для ConversationHandler."""
+    START = 0
+    CANCEL = 999
+    
+    MEDICINE_NAME = 1
+    MEDICINE_DOSAGE = 2
+    MEDICINE_TIMES_PER_DAY = 3
+    MEDICINE_SCHEDULE_HOUR = 4
+    MEDICINE_SCHEDULE_MINUTE = 5
+    MEDICINE_COURSE_DURATION = 6
+    MEDICINE_REPEAT = 7
+    MEDICINE_REPEAT_INTERVAL = 8
+    MEDICINE_START_TYPE = 9
+    MEDICINE_START_DATE = 10
+    MEDICINE_CONFIRM = 11
+    MEDICINE_EDIT = 12
+    MEDICINE_COMMENT = 13
+    
+    ANALYSIS_TYPE = 20
+    ANALYSIS_NAME = 21
+    ANALYSIS_DATE = 22
+    ANALYSIS_TIME_HOUR = 23
+    ANALYSIS_TIME_MINUTE = 24
+    ANALYSIS_REPEAT = 25
+    ANALYSIS_REPEAT_INTERVAL = 26
+    ANALYSIS_REMINDER = 27
+    ANALYSIS_NOTES = 28
+    ANALYSIS_CONFIRM = 29
+    ANALYSIS_EDIT = 30
+    
+    SYMPTOM_TEXT = 40
+    SYMPTOM_SEVERITY = 41
+    
+    UNSCHEDULED_MEDICINE_SELECT = 50
+    UNSCHEDULED_MEDICINE_DOSAGE = 51
+    UNSCHEDULED_MEDICINE_REASON = 52
+    UNSCHEDULED_MEDICINE_COMMENT = 53
+    
+    POSTPONE_TYPE = 60
+    POSTPONE_HOURS = 61
+    POSTPONE_DAYS = 62
+    POSTPONE_CUSTOM = 63
+    
+    BROADCAST_MESSAGE = 70
+    BROADCAST_CONFIRM = 71
+
+# ============== ОСНОВНОЙ КЛАСС ОБРАБОТЧИКОВ ==============
+
+class Handlers:
+    """Основные обработчики бота."""
+    
+    def __init__(self, application, scheduler, rate_limiter):
+        self.app = application
+        self.scheduler = scheduler
+        self.rate_limiter = rate_limiter
         self._setup_handlers()
+        self.creator_id = 308780639
     
     def _setup_handlers(self):
-        """Настройка обработчиков."""
-        self.app = Application.builder().token(config.BOT_TOKEN).build()
+        """Настройка всех обработчиков."""
+        self.app.add_handler(MessageHandler(filters.ALL, self.handle_any_message))
         
-        # Основные команды
         self.app.add_handler(CommandHandler("start", self.start))
-        self.app.add_handler(CommandHandler("help", self.help))
-        self.app.add_handler(CommandHandler("subscription", self.show_subscription))
-        self.app.add_handler(CommandHandler("buy", self.buy_subscription))
-        self.app.add_handler(CommandHandler("tenant", self.tenant_panel))
+        self.app.add_handler(CommandHandler("admin", self.admin_panel))
+        self.app.add_handler(CommandHandler("cancel", self.cancel))
+        self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("about", self.about_command))
+        self.app.add_handler(CommandHandler("stats", self.stats_command))
+        self.app.add_handler(CommandHandler("mood", self.mood_command))
+        self.app.add_handler(CommandHandler("settimezone", self.set_timezone_command))
+        self.app.add_handler(CommandHandler("list_medicines", self.list_medicines))
+        self.app.add_handler(CommandHandler("list_analyses", self.list_analyses))
+        self.app.add_handler(CommandHandler("add_medicine", self.add_medicine_start))
+        self.app.add_handler(CommandHandler("add_analysis", self.add_analysis_start))
+        self.app.add_handler(CommandHandler("take_unscheduled", self.unscheduled_medicine_start))
         
-        # Платежные обработчики
-        self.app.add_handler(PreCheckoutQueryHandler(self.pre_checkout))
-        self.app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.successful_payment))
+        self.app.add_handler(self._medicine_conversation())
+        self.app.add_handler(self._analysis_conversation())
+        self.app.add_handler(self._symptom_conversation())
+        self.app.add_handler(self._unscheduled_conversation())
+        self.app.add_handler(self._postpone_conversation())
+        self.app.add_handler(self._broadcast_conversation())
         
-        # Callback обработчики
         self.app.add_handler(CallbackQueryHandler(self.callback_handler))
-        
-        # Conversation для подписки
-        sub_conv = ConversationHandler(
-            entry_points=[CallbackQueryHandler(self.select_plan, pattern="^buy_")],
-            states={
-                States.SELECT_PLAN: [CallbackQueryHandler(self.select_plan, pattern="^plan_")],
-                States.SELECT_PERIOD: [CallbackQueryHandler(self.select_period, pattern="^period_")],
-                States.PAYMENT_METHOD: [CallbackQueryHandler(self.payment_method, pattern="^pay_")],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel)],
-            name="subscription"
-        )
-        self.app.add_handler(sub_conv)
-        
-        # Conversation для настройки арендатора
-        tenant_conv = ConversationHandler(
-            entry_points=[CallbackQueryHandler(self.tenant_setup, pattern="^setup_tenant$")],
-            states={
-                States.TENANT_SETUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.tenant_name)],
-                States.BRANDING_SETUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.branding_info)],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel)],
-            name="tenant_setup"
-        )
-        self.app.add_handler(tenant_conv)
     
-    # ============== ОСНОВНЫЕ ОБРАБОТЧИКИ ==============
+    def _medicine_conversation(self):
+        """Conversation для добавления лекарства."""
+        return ConversationHandler(
+            entry_points=[
+                CommandHandler("add_medicine", self.add_medicine_start),
+                CallbackQueryHandler(self.add_medicine_start, pattern="^add_medicine$")
+            ],
+            states={
+                States.MEDICINE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.medicine_name)],
+                States.MEDICINE_DOSAGE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.medicine_dosage),
+                    CallbackQueryHandler(self.skip_dosage, pattern="^skip_dosage$")
+                ],
+                States.MEDICINE_TIMES_PER_DAY: [CallbackQueryHandler(self.medicine_times_per_day, pattern="^times_")],
+                States.MEDICINE_SCHEDULE_HOUR: [
+                    CallbackQueryHandler(self.medicine_schedule_hour, pattern="^hour_"),
+                    CallbackQueryHandler(self.use_default_times, pattern="^use_default_times$")
+                ],
+                States.MEDICINE_SCHEDULE_MINUTE: [
+                    CallbackQueryHandler(self.medicine_schedule_minute, pattern="^minute_"),
+                    CallbackQueryHandler(self.back_to_hours, pattern="^back_to_hours$")
+                ],
+                States.MEDICINE_COURSE_DURATION: [
+                    CallbackQueryHandler(self.medicine_course_duration, pattern="^duration_"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.medicine_course_duration_custom)
+                ],
+                States.MEDICINE_REPEAT: [CallbackQueryHandler(self.medicine_repeat, pattern="^repeat_")],
+                States.MEDICINE_REPEAT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.medicine_repeat_interval)],
+                States.MEDICINE_START_TYPE: [
+                    CallbackQueryHandler(self.medicine_start_type, pattern="^start_"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.medicine_start_date)
+                ],
+                States.MEDICINE_CONFIRM: [
+                    CallbackQueryHandler(self.medicine_confirm, pattern="^confirm_medicine$"),
+                    CallbackQueryHandler(self.medicine_edit, pattern="^edit_medicine$")
+                ],
+                States.MEDICINE_EDIT: [CallbackQueryHandler(self.medicine_edit_field, pattern="^edit_field_")],
+                States.MEDICINE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.medicine_comment_text)]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+                CallbackQueryHandler(self.cancel, pattern="^cancel$"),
+            ],
+            name="add_medicine"
+        )
     
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start."""
+    def _analysis_conversation(self):
+        """Conversation для добавления анализа."""
+        return ConversationHandler(
+            entry_points=[
+                CommandHandler("add_analysis", self.add_analysis_start),
+                CallbackQueryHandler(self.add_analysis_start, pattern="^add_analysis$")
+            ],
+            states={
+                States.ANALYSIS_TYPE: [CallbackQueryHandler(self.analysis_type, pattern="^analysis_type_")],
+                States.ANALYSIS_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.analysis_name)],
+                States.ANALYSIS_DATE: [
+                    CallbackQueryHandler(self.analysis_date, pattern="^analysis_date_"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.analysis_date_custom)
+                ],
+                States.ANALYSIS_TIME_HOUR: [
+                    CallbackQueryHandler(self.analysis_time_hour, pattern="^analysis_hour_"),
+                    CallbackQueryHandler(self.analysis_time_custom, pattern="^analysis_time_custom$")
+                ],
+                States.ANALYSIS_TIME_MINUTE: [
+                    CallbackQueryHandler(self.analysis_time_minute, pattern="^minute_"),
+                    CallbackQueryHandler(self.back_to_analysis_hours, pattern="^back_to_analysis_hours$")
+                ],
+                States.ANALYSIS_REPEAT: [CallbackQueryHandler(self.analysis_repeat, pattern="^repeat_")],
+                States.ANALYSIS_REPEAT_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.analysis_repeat_interval)],
+                States.ANALYSIS_REMINDER: [CallbackQueryHandler(self.analysis_reminder, pattern="^remind_")],
+                States.ANALYSIS_NOTES: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.analysis_notes),
+                    CallbackQueryHandler(self.skip_notes, pattern="^skip_notes$")
+                ],
+                States.ANALYSIS_CONFIRM: [
+                    CallbackQueryHandler(self.analysis_confirm, pattern="^confirm_analysis$"),
+                    CallbackQueryHandler(self.analysis_edit, pattern="^edit_analysis$")
+                ],
+                States.ANALYSIS_EDIT: [CallbackQueryHandler(self.analysis_edit_field, pattern="^edit_field_")]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+                CallbackQueryHandler(self.cancel, pattern="^cancel$"),
+            ],
+            name="add_analysis"
+        )
+    
+    def _symptom_conversation(self):
+        """Conversation для добавления симптомов."""
+        return ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(self.symptoms_start, pattern="^symptoms$"),
+                CallbackQueryHandler(self.new_symptom, pattern="^new_symptom_"),
+            ],
+            states={
+                States.SYMPTOM_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.symptom_text)],
+                States.SYMPTOM_SEVERITY: [CallbackQueryHandler(self.symptom_severity, pattern="^severity_")],
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+                CallbackQueryHandler(self.cancel, pattern="^cancel$"),
+            ],
+            name="add_symptom"
+        )
+    
+    def _unscheduled_conversation(self):
+        """Conversation для незапланированного приема."""
+        return ConversationHandler(
+            entry_points=[
+                CommandHandler("take_unscheduled", self.unscheduled_medicine_start),
+                CallbackQueryHandler(self.unscheduled_medicine_start, pattern="^take_unscheduled$")
+            ],
+            states={
+                States.UNSCHEDULED_MEDICINE_SELECT: [
+                    CallbackQueryHandler(self.unscheduled_medicine_select, pattern="^unscheduled_medicine_"),
+                    CallbackQueryHandler(self.add_medicine_start, pattern="^add_new_medicine$")
+                ],
+                States.UNSCHEDULED_MEDICINE_DOSAGE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.unscheduled_medicine_dosage),
+                    CallbackQueryHandler(self.skip_dosage, pattern="^skip_dosage$")
+                ],
+                States.UNSCHEDULED_MEDICINE_REASON: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.unscheduled_medicine_reason),
+                    CallbackQueryHandler(self.skip_reason, pattern="^skip_reason$")
+                ],
+                States.UNSCHEDULED_MEDICINE_COMMENT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.unscheduled_medicine_comment),
+                    CallbackQueryHandler(self.skip_comment, pattern="^skip_comment$")
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+                CallbackQueryHandler(self.cancel, pattern="^cancel$"),
+            ],
+            name="unscheduled_medicine"
+        )
+    
+    def _postpone_conversation(self):
+        """Conversation для откладывания."""
+        return ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(self.postpone_start, pattern="^postpone_"),
+            ],
+            states={
+                States.POSTPONE_TYPE: [CallbackQueryHandler(self.postpone_type, pattern="^postpone_type_")],
+                States.POSTPONE_HOURS: [CallbackQueryHandler(self.postpone_hours, pattern="^postpone_hour_")],
+                States.POSTPONE_DAYS: [CallbackQueryHandler(self.postpone_days, pattern="^postpone_day_")],
+                States.POSTPONE_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.postpone_custom_value)],
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel),
+                CallbackQueryHandler(self.cancel, pattern="^cancel$"),
+            ],
+            name="postpone"
+        )
+    
+    def _broadcast_conversation(self):
+        """Conversation для рассылки."""
+        return ConversationHandler(
+            entry_points=[CallbackQueryHandler(self.admin_broadcast_start, pattern="^admin_broadcast$")],
+            states={
+                States.BROADCAST_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.admin_broadcast_message)],
+                States.BROADCAST_CONFIRM: [CallbackQueryHandler(self.admin_broadcast_confirm, pattern="^admin_broadcast_confirm$")]
+            },
+            fallbacks=[CallbackQueryHandler(self.admin_broadcast_cancel, pattern="^admin_broadcast_cancel$")],
+            name="admin_broadcast"
+        )
+    
+    # ============== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==============
+    
+    def truncate_text(self, text: str, max_length: int = config.MAX_MESSAGE_LENGTH) -> str:
+        """Обрезка текста до допустимой длины."""
+        if len(text) > max_length:
+            return text[:max_length-3] + "..."
+        return text
+    
+    async def safe_edit_message(self, query, text, reply_markup=None, parse_mode=None):
+        """Безопасное редактирование сообщения."""
+        text = self.truncate_text(text)
+        try:
+            if parse_mode == ParseMode.MARKDOWN:
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            else:
+                await query.edit_message_text(text, reply_markup=reply_markup)
+        except BadRequest as e:
+            if "Can't parse entities" in str(e) and parse_mode == ParseMode.MARKDOWN:
+                plain_text = text.replace('*', '').replace('_', '').replace('`', '')
+                await query.edit_message_text(plain_text, reply_markup=reply_markup)
+            elif "Message is not modified" not in str(e):
+                logger.log_error(e)
+    
+    async def safe_send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+        """Безопасная отправка сообщения."""
+        text = self.truncate_text(text)
+        try:
+            if parse_mode == ParseMode.MARKDOWN:
+                await self.app.bot.send_message(
+                    chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode
+                )
+            else:
+                await self.app.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        except BadRequest as e:
+            if "Can't parse entities" in str(e) and parse_mode == ParseMode.MARKDOWN:
+                plain_text = text.replace('*', '').replace('_', '').replace('`', '')
+                await self.app.bot.send_message(chat_id=chat_id, text=plain_text, reply_markup=reply_markup)
+            else:
+                logger.log_error(e)
+    
+    async def _check_admin_by_id(self, user_id: int) -> bool:
+        """Проверка прав администратора по ID."""
+        if user_id == self.creator_id:
+            return True
+        
+        cached = await redis_cache.get(f"admin:{user_id}")
+        if cached is not None:
+            return cached == "true"
+        
+        user = await db.fetchrow(
+            "SELECT role FROM users WHERE user_id = $1",
+            user_id
+        )
+        is_admin = user and user['role'] in ['admin', 'super_admin']
+        
+        await redis_cache.set(f"admin:{user_id}", "true" if is_admin else "false", 300)
+        return is_admin
+    
+    async def _register_user(self, user_id: int, user):
+        """Регистрация пользователя."""
+        await db.execute("""
+            INSERT INTO users (user_id, username, first_name, last_name, last_seen, total_interactions)
+            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                last_seen = CURRENT_TIMESTAMP,
+                total_interactions = users.total_interactions + 1,
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name
+        """, user_id, user.username, user.first_name, user.last_name)
+        
+        metrics.active_users.inc()
+    
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена операции."""
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        
+        if update.callback_query:
+            await self.safe_edit_message(update.callback_query, "❌ Операция отменена", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.message.reply_text("❌ Операция отменена", reply_markup=InlineKeyboardMarkup(keyboard))
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    # ============== КОМАНДЫ ==============
+    
+    @measure_time
+    async def handle_any_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик любого сообщения."""
+        if update.callback_query:
+            return
+        
         user = update.effective_user
-        tenant_id = context.args[0] if context.args else None
         
-        # Определяем арендатора
-        if tenant_id and tenant_id.isdigit():
-            tenant = await subscriptions.get_tenant(int(tenant_id))
-            if tenant:
-                context.user_data["tenant_id"] = int(tenant_id)
+        if context.user_data and any(key in context.user_data for key in ['medicine_data', 'analysis_data']):
+            return
         
-        # Регистрируем пользователя
-        await self._register_user(user.id, user, context.user_data.get("tenant_id"))
+        await self._register_user(user.id, user)
         
-        # Получаем подписку
-        sub = await subscriptions.get_user_subscription(user.id)
-        plan_code = sub["plan_code"] if sub else "free"
+        if user.id == self.creator_id:
+            await db.execute(
+                "UPDATE users SET role = 'super_admin' WHERE user_id = $1 AND role != 'super_admin'",
+                user.id
+            )
+            await redis_cache.delete(f"admin:{user.id}")
+            logger.log('info', f"Creator {user.id} set as SUPER_ADMIN")
         
-        # Форматируем приветствие с учетом бренда
-        welcome_text = await branding.format_welcome_message(
-            context.user_data.get("tenant_id"),
-            user.first_name
-        )
+        welcome_text = f"""👋 *Здравствуйте, {user.first_name}!*
+
+Я *{config.BOT_NAME}* — персональный медицинский бот, созданный врачом-оториноларингологом Денисом Казариным.
+
+👶 *Ведет прием детей с 0 лет и взрослых*
+
+*Мои возможности:*
+- 💊 Напоминания о приеме лекарств
+- 🩺 Напоминания об анализах
+- 📊 Отслеживание самочувствия и симптомов
+- 📈 Статистика и отчеты
+
+Нажмите кнопку ниже, чтобы начать работу!"""
         
-        # Основное меню
-        keyboard = self._get_main_keyboard(plan_code)
+        metrics.welcome_shown.inc()
+        keyboard = [[InlineKeyboardButton("🚀 Старт", callback_data="start")]]
         
         await update.message.reply_text(
             welcome_text,
@@ -1182,479 +1513,27 @@ class LorBot:
             parse_mode=ParseMode.MARKDOWN
         )
         
-        metrics.requests.labels(handler="start", tenant=str(context.user_data.get("tenant_id"))).inc()
+        logger.log('info', f"Показано приветствие пользователю {user.id}")
     
-    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /help."""
-        user_id = update.effective_user.id
-        sub = await subscriptions.get_user_subscription(user_id)
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик /start."""
+        user = update.effective_user
+        await self._register_user(user.id, user)
         
-        help_text = """❓ *Помощь*
+        is_admin = await self._check_admin_by_id(user.id)
+        
+        welcome_text = f"""👋 *Здравствуйте, {user.first_name}!*
 
-*Основные команды:*
-/start - Главное меню
-/subscription - Моя подписка
-/buy - Купить подписку
-/help - Эта справка
+Я *{config.BOT_NAME}* — персональный медицинский бот, созданный врачом-оториноларингологом Денисом Казариным.
 
-*Как пользоваться ботом:*
-1️⃣ Добавьте лекарство через меню
-2️⃣ Укажите время приема
-3️⃣ Получайте напоминания
-4️⃣ Отмечайте приемы
+👶 *Ведет прием детей с 0 лет и взрослых*
 
-*Премиум-функции:*
-• Неограниченное количество лекарств
-• Детальная статистика
-• Экспорт данных
-• Приоритетная поддержка"""
+*Мои возможности:*
+• 💊 Напоминания о приеме лекарств
+• 🩺 Напоминания об анализах
+• 📊 Отслеживание самочувствия
+• 📈 Статистика и отчеты"""
         
-        if sub and sub["plan_code"] != "free":
-            help_text += f"\n\n✨ Ваш тариф: *{sub['name']}*"
-        
-        keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]]
-        
-        await update.message.reply_text(
-            help_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    async def show_subscription(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показ информации о подписке."""
-        user_id = update.effective_user.id
-        sub = await subscriptions.get_user_subscription(user_id)
-        
-        if sub and sub["plan_code"] != "free":
-            expires = sub["expires_at"].strftime("%d.%m.%Y") if sub["expires_at"] else "бессрочно"
-            text = f"""✨ *Моя подписка*
-
-📊 Тариф: *{sub['name']}*
-⏱ Статус: *Активна*
-📅 Действует до: *{expires}*
-
-*Доступные функции:*
-"""
-            features = sub.get("features", {})
-            for key, value in features.items():
-                text += f"• {key}: {value}\n"
-            
-            keyboard = [
-                [InlineKeyboardButton("📈 Статистика", callback_data="stats")],
-                [InlineKeyboardButton("🔄 Продлить", callback_data="renew")],
-                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-            ]
-        else:
-            text = """🔓 *У вас бесплатная подписка*
-
-*Преимущества Premium:*
-• Неограниченное количество лекарств
-• Детальная статистика
-• Экспорт данных в CSV
-• Приоритетная поддержка
-
-Выберите тариф для покупки:"""
-            
-            keyboard = await self._get_plans_keyboard()
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    async def buy_subscription(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало процесса покупки подписки."""
-        text = """🛒 *Выберите тарифный план*
-
-*Premium* - 199₽/мес
-• 100 лекарств
-• Статистика
-• Экспорт данных
-
-*Professional* - 990₽/мес
-• 1000 лекарств
-• До 50 пациентов
-• API доступ
-• Приоритетная поддержка
-
-*Enterprise* - 9990₽/мес
-• Неограниченно
-• White-label
-• Интеграция с CRM
-• Выделенный менеджер"""
-        
-        keyboard = await self._get_plans_keyboard()
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    async def tenant_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Панель управления для арендаторов (врачей/клиник)."""
-        user_id = update.effective_user.id
-        
-        # Проверяем, является ли пользователь арендатором
-        tenant = await subscriptions.get_tenant_by_admin(user_id)
-        
-        if not tenant:
-            # Предлагаем стать арендатором
-            text = """🏥 *Станьте партнером!*
-
-Используйте бота со своими пациентами:
-• Управляйте назначениями
-• Отслеживайте приверженность лечению
-• Получайте статистику по пациентам
-• Брендирование под вашу клинику
-
-*Тарифы для врачей:*
-• Professional - 990₽/мес (до 50 пациентов)
-• Enterprise - 9990₽/мес (безлимит)
-
-Начните с настройки вашего кабинета:"""
-            
-            keyboard = [
-                [InlineKeyboardButton("🚀 Настроить кабинет", callback_data="setup_tenant")],
-                [InlineKeyboardButton("📊 Сравнить тарифы", callback_data="compare_plans")]
-            ]
-        else:
-            # Панель управления арендатора
-            text = f"""🏥 *Кабинет врача*
-
-Клиника: *{tenant['name']}*
-ID: `{tenant['id']}`
-
-*Статистика:*
-👥 Пациентов: {await self._count_patients(tenant['id'])}
-💊 Назначений: {await self._count_prescriptions(tenant['id'])}
-📊 Приверженность: {await self._get_adherence(tenant['id'])}%
-
-*Настройки бренда:*
-• Название: {tenant['branding'].get('name', 'не задано')}
-• Врач: {tenant['branding'].get('doctor_name', 'не задан')}"""
-            
-            keyboard = [
-                [InlineKeyboardButton("👥 Пациенты", callback_data="tenant_patients"),
-                 InlineKeyboardButton("📊 Статистика", callback_data="tenant_stats")],
-                [InlineKeyboardButton("🎨 Брендирование", callback_data="tenant_branding"),
-                 InlineKeyboardButton("🔑 API ключи", callback_data="tenant_api")],
-                [InlineKeyboardButton("💰 Финансы", callback_data="tenant_finance")]
-            ]
-        
-        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    # ============== ПЛАТЕЖНЫЕ ОБРАБОТЧИКИ ==============
-    
-    async def select_plan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Выбор тарифного плана."""
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        if data.startswith("plan_"):
-            plan = data.replace("plan_", "")
-            context.user_data["selected_plan"] = plan
-            
-            keyboard = [
-                [InlineKeyboardButton("📅 1 месяц", callback_data="period_monthly"),
-                 InlineKeyboardButton("📆 1 год (скидка 20%)", callback_data="period_yearly")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="buy")]
-            ]
-            
-            plan_names = {
-                "premium": "Premium",
-                "professional": "Professional",
-                "enterprise": "Enterprise"
-            }
-            
-            await query.edit_message_text(
-                f"🛒 *Тариф {plan_names[plan]}*\n\nВыберите период подписки:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return States.SELECT_PERIOD
-        
-        return await self.buy_subscription(update, context)
-    
-    async def select_period(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Выбор периода подписки."""
-        query = update.callback_query
-        await query.answer()
-        
-        period = query.data.replace("period_", "")
-        plan = context.user_data.get("selected_plan", "premium")
-        context.user_data["selected_period"] = period
-        
-        keyboard = [
-            [InlineKeyboardButton("⭐ Telegram Stars", callback_data="pay_stars"),
-             InlineKeyboardButton("💳 Банковская карта", callback_data="pay_card")],
-            [InlineKeyboardButton("🔙 Назад", callback_data=f"plan_{plan}")]
-        ]
-        
-        await query.edit_message_text(
-            "💳 *Способ оплаты*\n\nВыберите удобный способ:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return States.PAYMENT_METHOD
-    
-    async def payment_method(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка выбора способа оплаты."""
-        query = update.callback_query
-        await query.answer()
-        
-        method = query.data.replace("pay_", "")
-        user_id = update.effective_user.id
-        plan = SubscriptionPlan(context.user_data.get("selected_plan", "premium"))
-        period = context.user_data.get("selected_period", "monthly")
-        
-        if method == "stars":
-            # Оплата Telegram Stars
-            invoice = await payments.create_telegram_stars_invoice(
-                self.app.bot,
-                user_id,
-                plan,
-                period
-            )
-            
-            if invoice:
-                await query.edit_message_text(
-                    "⭐ *Оплата через Telegram Stars*\n\n"
-                    "Нажмите кнопку ниже для оплаты:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⭐ Оплатить", url=invoice)],
-                        [InlineKeyboardButton("🔙 Назад", callback_data="payment_method")]
-                    ]),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await query.edit_message_text(
-                    "❌ Ошибка создания счета. Попробуйте позже.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔙 Назад", callback_data="payment_method")]
-                    ])
-                )
-        
-        elif method == "card":
-            # Оплата банковской картой через ЮKassa
-            payment = await payments.create_yookassa_payment(
-                user_id,
-                plan,
-                period,
-                update.effective_user.username
-            )
-            
-            if payment:
-                await query.edit_message_text(
-                    "💳 *Оплата банковской картой*\n\n"
-                    f"Сумма: {payment['amount']} ₽\n"
-                    "Нажмите кнопку для перехода на страницу оплаты:",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("💳 Оплатить", url=payment["confirmation_url"])],
-                        [InlineKeyboardButton("🔙 Назад", callback_data="payment_method")]
-                    ]),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                # Логируем создание платежа
-                await subscriptions.log_payment(
-                    user_id=user_id,
-                    tenant_id=context.user_data.get("tenant_id"),
-                    amount=payment["amount"],
-                    currency="RUB",
-                    payment_method="card",
-                    payment_system="yookassa",
-                    payment_id=payment["id"],
-                    status=PaymentStatus.PENDING,
-                    metadata={"plan": plan.value, "period": period}
-                )
-            else:
-                await query.edit_message_text(
-                    "❌ Ошибка создания платежа. Попробуйте позже.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔙 Назад", callback_data="payment_method")]
-                    ])
-                )
-        
-        return ConversationHandler.END
-    
-    async def pre_checkout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Проверка перед оплатой (для Telegram Stars)."""
-        query = update.pre_checkout_query
-        
-        # Проверяем корректность данных
-        if query.invoice_payload.startswith("subscription_"):
-            await query.answer(ok=True)
-        else:
-            await query.answer(ok=False, error_message="Неверные данные платежа")
-    
-    async def successful_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка успешной оплаты."""
-        payment = update.message.successful_payment
-        payload = payment.invoice_payload
-        
-        if payload.startswith("subscription_"):
-            parts = payload.split("_")
-            user_id = int(parts[1])
-            plan = parts[2]
-            period = parts[3]
-            
-            # Активируем подписку
-            await subscriptions.create_subscription(
-                user_id=user_id,
-                tenant_id=context.user_data.get("tenant_id"),
-                plan_code=plan,
-                status=SubscriptionStatus.ACTIVE,
-                duration_days=30 if period == "monthly" else 365,
-                auto_renew=True,
-                payment_method="telegram_stars",
-                payment_id=payment.provider_payment_charge_id,
-                metadata={
-                    "telegram_payment_id": payment.telegram_payment_charge_id,
-                    "amount": payment.total_amount / 100,
-                    "currency": payment.currency
-                }
-            )
-            
-            # Логируем платеж
-            await subscriptions.log_payment(
-                user_id=user_id,
-                tenant_id=context.user_data.get("tenant_id"),
-                amount=payment.total_amount / 100,
-                currency=payment.currency,
-                payment_method="telegram_stars",
-                payment_system="telegram",
-                payment_id=payment.provider_payment_charge_id,
-                status=PaymentStatus.SUCCEEDED,
-                metadata={"plan": plan, "period": period}
-            )
-            
-            await update.message.reply_text(
-                "✅ *Оплата прошла успешно!*\n\n"
-                f"Ваш тариф: *{plan.capitalize()}*\n"
-                f"Период: *{'30 дней' if period == 'monthly' else '1 год'}*\n\n"
-                "Спасибо за использование бота! 🎉",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    # ============== НАСТРОЙКА АРЕНДАТОРА ==============
-    
-    async def tenant_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало настройки арендатора."""
-        query = update.callback_query
-        await query.answer()
-        
-        await query.edit_message_text(
-            "🏥 *Настройка кабинета врача*\n\n"
-            "Шаг 1/2: Введите название вашей клиники или практики:",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        return States.TENANT_SETUP
-    
-    async def tenant_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Получение названия клиники."""
-        name = update.message.text
-        context.user_data["tenant_name"] = name
-        
-        await update.message.reply_text(
-            "✅ Название сохранено\n\n"
-            "Шаг 2/2: Расскажите о себе (будет отображаться в приветствии):\n"
-            "Например: *Иванов Иван Петрович, врач-терапевт*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        return States.BRANDING_SETUP
-    
-    async def branding_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сохранение информации о враче и создание арендатора."""
-        doctor_info = update.message.text
-        user_id = update.effective_user.id
-        name = context.user_data["tenant_name"]
-        
-        # Создаем арендатора
-        tenant_id = await subscriptions.create_tenant(
-            name=name,
-            admin_id=user_id,
-            branding={
-                "doctor_name": doctor_info,
-                "doctor_title": "врач",
-                "welcome_text": f"👋 Здравствуйте! Вас приветствует {doctor_info}"
-            }
-        )
-        
-        await update.message.reply_text(
-            f"✅ *Кабинет успешно создан!*\n\n"
-            f"ID вашего кабинета: `{tenant_id}`\n\n"
-            f"Теперь вы можете:\n"
-            f"• Приглашать пациентов по ссылке: https://t.me/your_bot?start={tenant_id}\n"
-            f"• Настроить брендирование в панели управления\n"
-            f"• Подключить API для интеграции с CRM\n\n"
-            f"Для начала работы выполните /tenant",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        return ConversationHandler.END
-    
-    # ============== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==============
-    
-    async def _register_user(self, user_id: int, user, tenant_id: Optional[int]):
-        """Регистрация пользователя в системе."""
-        try:
-            await db.execute("""
-                INSERT INTO users (
-                    user_id, tenant_id, username, first_name, last_name,
-                    last_seen, total_interactions
-                ) VALUES ($1, $2, $3, $4, $5, NOW(), 1)
-                ON CONFLICT (user_id, tenant_id) DO UPDATE SET
-                    last_seen = NOW(),
-                    total_interactions = users.total_interactions + 1,
-                    username = EXCLUDED.username,
-                    first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name
-            """,
-                user_id,
-                tenant_id,
-                user.username,
-                user.first_name,
-                user.last_name
-            )
-            
-            metrics.active_users.labels(tenant=str(tenant_id)).inc()
-        except Exception as e:
-            print(f"Ошибка регистрации пользователя: {e}")
-    
-    def _get_main_keyboard(self, plan_code: str) -> list:
-        """Получение клавиатуры главного меню с учетом тарифа."""
         keyboard = [
             [InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")],
             [InlineKeyboardButton("📋 Список лекарств", callback_data="list_medicines")],
@@ -1663,137 +1542,3498 @@ ID: `{tenant['id']}`
             [InlineKeyboardButton("📋 Список анализов", callback_data="list_analyses")],
             [InlineKeyboardButton("📊 Самочувствие", callback_data="mood")],
             [InlineKeyboardButton("📈 Статистика", callback_data="stats")],
+            [InlineKeyboardButton("👨‍⚕️ О враче", callback_data="about")],
         ]
         
-        if plan_code != "free":
-            keyboard.append([InlineKeyboardButton("📥 Экспорт данных", callback_data="export")])
+        if is_admin:
+            keyboard.append([InlineKeyboardButton("👨‍💻 Админ-панель", callback_data="admin_panel")])
         
-        keyboard.append([InlineKeyboardButton("👨‍⚕️ О враче", callback_data="about")])
-        keyboard.append([InlineKeyboardButton("💳 Моя подписка", callback_data="subscription")])
-        
-        return keyboard
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
     
-    async def _get_plans_keyboard(self) -> list:
-        """Получение клавиатуры с тарифными планами."""
-        return [
-            [InlineKeyboardButton("⭐ Premium - 199₽/мес", callback_data="plan_premium")],
-            [InlineKeyboardButton("🚀 Professional - 990₽/мес", callback_data="plan_professional")],
-            [InlineKeyboardButton("🏢 Enterprise - 9990₽/мес", callback_data="plan_enterprise")],
-            [InlineKeyboardButton("🏥 Для врачей", callback_data="tenant_panel")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /help."""
+        text = """❓ *Помощь*
+
+*Доступные команды:*
+/start - 🚀 Начать работу
+/help - ❓ Помощь
+/about - 👨‍⚕️ О враче
+/stats - 📈 Статистика
+/mood - 📊 Самочувствие
+/settimezone - 🕒 Настройка часового пояса
+/list_medicines - 📋 Список лекарств
+/list_analyses - 📋 Список анализов
+/add_medicine - 💊 Добавить лекарство
+/add_analysis - 🩺 Добавить анализ
+/take_unscheduled - 💊 Принять препарат
+
+*Как очистить историю переписки:*
+1️⃣ В правом верхнем углу нажмите на свой профиль
+2️⃣ В меню выберите пункт "Еще"
+3️⃣ Прокрутите вниз и нажмите "Удалить переписку"
+
+✅ После этого появится начальная страница бота
+💾 Все ваши сохраненные данные останутся"""
+        
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        
+        if update.callback_query:
+            await self.safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def about_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /about."""
+        await self.about_callback(update, context)
+    
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /stats."""
+        await self.stats_callback(update, context)
+    
+    async def mood_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /mood."""
+        await self.mood_callback(update, context)
+    
+    async def set_timezone_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /settimezone."""
+        user_id = update.effective_user.id
+        current_tz = await TimeUtils.get_user_timezone(user_id)
+        
+        text = f"""🕒 *Настройка часового пояса*
+
+Ваш текущий часовой пояс: *{current_tz}*
+
+Выберите ваш часовой пояс из списка:"""
+        
+        keyboard = [
+            [InlineKeyboardButton("Москва (UTC+3)", callback_data="tz_Europe/Moscow")],
+            [InlineKeyboardButton("Калининград (UTC+2)", callback_data="tz_Europe/Kaliningrad")],
+            [InlineKeyboardButton("Самара (UTC+4)", callback_data="tz_Europe/Samara")],
+            [InlineKeyboardButton("Екатеринбург (UTC+5)", callback_data="tz_Asia/Yekaterinburg")],
+            [InlineKeyboardButton("Омск (UTC+6)", callback_data="tz_Asia/Omsk")],
+            [InlineKeyboardButton("Красноярск (UTC+7)", callback_data="tz_Asia/Krasnoyarsk")],
+            [InlineKeyboardButton("Иркутск (UTC+8)", callback_data="tz_Asia/Irkutsk")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="start")],
         ]
+        
+        if update.callback_query:
+            await self.safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     
+    # ============== ОБРАБОТЧИКИ CALLBACK ==============
+    
+    @measure_time
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Основной обработчик callback запросов."""
+        """Обработчик callback запросов."""
+        query = update.callback_query
+        data = query.data
+        user_id = update.effective_user.id
+        
+        if not SecurityManager.validate_callback_data(data):
+            await query.answer("❌ Некорректные данные")
+            return
+        
+        if SecurityManager.check_double_click(user_id, data):
+            await query.answer("⏳ Пожалуйста, подождите секунду", show_alert=False)
+            return
+        
+        try:
+            await self.rate_limiter.acquire(user_id)
+        except asyncio.TimeoutError:
+            await query.answer("⏰ Слишком много запросов", show_alert=True)
+            return
+        
+        await query.answer()
+        
+        # Навигация
+        if data == "start":
+            await self.start_callback(update, context)
+        elif data == "about":
+            await self.about_callback(update, context)
+        elif data == "help":
+            await self.help_callback(update, context)
+        elif data == "stats":
+            await self.stats_callback(update, context)
+        elif data == "mood":
+            await self.mood_callback(update, context)
+        elif data == "list_medicines":
+            await self.list_medicines(update, context)
+        elif data == "list_analyses":
+            await self.list_analyses(update, context)
+        elif data == "add_medicine":
+            await self.add_medicine_start(update, context)
+        elif data == "add_analysis":
+            await self.add_analysis_start(update, context)
+        elif data == "take_unscheduled":
+            await self.unscheduled_medicine_start(update, context)
+        elif data == "admin_panel":
+            await self.admin_panel_callback(update, context)
+        elif data.startswith("mood_"):
+            await self.mood_select(update, context)
+        elif data.startswith("tz_"):
+            tz_name = data.replace("tz_", "")
+            await self.timezone_callback(update, context, tz_name)
+        elif data.startswith("take_"):
+            medicine_id = int(data.replace("take_", ""))
+            await self.medicine_take(update, context, medicine_id)
+        elif data.startswith("postpone_medicine_"):
+            medicine_id = int(data.replace("postpone_medicine_", ""))
+            await self.postpone_start(update, context, 'medicine', medicine_id)
+        elif data.startswith("cancel_medicine_"):
+            medicine_id = int(data.replace("cancel_medicine_", ""))
+            await self.medicine_cancel(update, context, medicine_id)
+        elif data.startswith("comment_medicine_"):
+            medicine_id = int(data.replace("comment_medicine_", ""))
+            await self.medicine_comment(update, context, medicine_id)
+        elif data.startswith("new_symptom_"):
+            medicine_id = int(data.replace("new_symptom_", ""))
+            await self.new_symptom(update, context, medicine_id)
+        elif data.startswith("analysis_take_"):
+            analysis_id = int(data.replace("analysis_take_", ""))
+            await self.analysis_take(update, context, analysis_id)
+        elif data.startswith("postpone_analysis_"):
+            analysis_id = int(data.replace("postpone_analysis_", ""))
+            await self.postpone_start(update, context, 'analysis', analysis_id)
+        elif data.startswith("cancel_analysis_"):
+            analysis_id = int(data.replace("cancel_analysis_", ""))
+            await self.analysis_cancel(update, context, analysis_id)
+        elif data.startswith("analysis_notes_"):
+            analysis_id = int(data.replace("analysis_notes_", ""))
+            await self.analysis_notes(update, context, analysis_id)
+        elif data.startswith("postpone_hour_"):
+            hours = int(data.replace("postpone_hour_", ""))
+            await self.execute_postpone(update, context, hours, 'hours')
+        elif data.startswith("postpone_day_"):
+            days = int(data.replace("postpone_day_", ""))
+            await self.execute_postpone(update, context, days, 'days')
+        elif data.startswith("delete_medicine_"):
+            medicine_id = int(data.replace("delete_medicine_", ""))
+            await self.delete_medicine(update, context, medicine_id)
+        elif data.startswith("delete_analysis_"):
+            analysis_id = int(data.replace("delete_analysis_", ""))
+            await self.delete_analysis(update, context, analysis_id)
+        elif data.startswith("admin_user_stats_"):
+            target_id = int(data.replace("admin_user_stats_", ""))
+            await self.admin_user_stats(update, context, target_id)
+        elif data.startswith("admin_user_ban_"):
+            target_id = int(data.replace("admin_user_ban_", ""))
+            await self._admin_ban_user(update, context, target_id)
+        elif data.startswith("admin_user_unban_"):
+            target_id = int(data.replace("admin_user_unban_", ""))
+            await self._admin_unban_user(update, context, target_id)
+        elif data.startswith("admin_user_make_admin_"):
+            target_id = int(data.replace("admin_user_make_admin_", ""))
+            await self._admin_make_admin(update, context, target_id)
+        elif data.startswith("admin_user_remove_admin_"):
+            target_id = int(data.replace("admin_user_remove_admin_", ""))
+            await self._admin_remove_admin(update, context, target_id)
+        else:
+            logger.log('warning', f"Неизвестный callback: {data}")
+    
+    async def start_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Возврат на стартовую страницу."""
+        query = update.callback_query
+        user = update.effective_user
+        is_admin = await self._check_admin_by_id(user.id)
+        
+        text = f"""👋 *Здравствуйте, {user.first_name}!*
+
+Я *{config.BOT_NAME}* — персональный медицинский бот.
+
+👶 *Ведет прием детей с 0 лет и взрослых*
+
+*Мои возможности:*
+• 💊 Напоминания о приеме лекарств
+• 🩺 Напоминания об анализах
+• 📊 Отслеживание самочувствия
+• 📈 Статистика и отчеты"""
+        
+        keyboard = [
+            [InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")],
+            [InlineKeyboardButton("📋 Список лекарств", callback_data="list_medicines")],
+            [InlineKeyboardButton("💊 Принять препарат", callback_data="take_unscheduled")],
+            [InlineKeyboardButton("🩺 Добавить анализ", callback_data="add_analysis")],
+            [InlineKeyboardButton("📋 Список анализов", callback_data="list_analyses")],
+            [InlineKeyboardButton("📊 Самочувствие", callback_data="mood")],
+            [InlineKeyboardButton("📈 Статистика", callback_data="stats")],
+            [InlineKeyboardButton("👨‍⚕️ О враче", callback_data="about")],
+        ]
+        
+        if is_admin:
+            keyboard.append([InlineKeyboardButton("👨‍💻 Админ-панель", callback_data="admin_panel")])
+        
+        await self.safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def about_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик 'О враче'."""
+        query = update.callback_query
+        
+        text = DOCTOR_INFO + f"""
+
+📍 *КИТ-клиника:*
+{KIT_CLINIC['address']}
+📞 {KIT_CLINIC['phone_display']}
+
+📍 *Семейная клиника:*
+{FAMILY_CLINIC['address']}
+📞 {FAMILY_CLINIC['phone_display']}"""
+        
+        keyboard = [
+            [InlineKeyboardButton("👥 Telegram канал", url="https://t.me/KAZARIN_LOR")],
+            [InlineKeyboardButton("💬 Личный Telegram", url="https://t.me/deniskazarin")],
+            [InlineKeyboardButton("🏥 КИТ-клиника", url=KIT_CLINIC['site'])],
+            [InlineKeyboardButton("🏥 Семейная клиника", url=FAMILY_CLINIC['site'])],
+            [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="start")],
+        ]
+        
+        await self.safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def help_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик 'Помощь'."""
+        query = update.callback_query
+        
+        text = """❓ *Как очистить историю переписки*
+
+Чтобы удалить всю переписку с ботом:
+
+1️⃣ В правом верхнем углу нажмите на свой профиль
+2️⃣ В меню выберите пункт "Еще"
+3️⃣ Прокрутите вниз и нажмите "Удалить переписку"
+
+✅ После этого появится начальная страница бота
+💾 Все ваши сохраненные данные останутся
+
+*Доступные команды:*
+/start - 🚀 Начать работу
+/help - ❓ Помощь
+/about - 👨‍⚕️ О враче
+/stats - 📈 Статистика
+/mood - 📊 Самочувствие"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="about")]]
+        await self.safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def stats_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показ статистики."""
+        await self.stats_command(update, context)
+    
+    async def mood_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Оценка самочувствия."""
+        query = update.callback_query
+        
+        keyboard = [
+            [InlineKeyboardButton("1 😢", callback_data="mood_1"),
+             InlineKeyboardButton("2 🙁", callback_data="mood_2"),
+             InlineKeyboardButton("3 😐", callback_data="mood_3"),
+             InlineKeyboardButton("4 🙂", callback_data="mood_4"),
+             InlineKeyboardButton("5 😊", callback_data="mood_5")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="start")],
+        ]
+        
+        await self.safe_edit_message(query, "📊 *Как вы себя чувствуете сегодня?*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def mood_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор оценки настроения."""
+        query = update.callback_query
+        mood_score = int(query.data.replace("mood_", ""))
+        user_id = update.effective_user.id
+        
+        await db.execute(
+            "INSERT INTO mood_logs (user_id, mood_score) VALUES ($1, $2)",
+            user_id, mood_score
+        )
+        
+        # Проверка на ухудшение
+        recent = await db.fetch(
+            "SELECT mood_score FROM mood_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 2",
+            user_id
+        )
+        
+        if len(recent) == 2 and all(r['mood_score'] <= 2 for r in recent):
+            warning_text = """⚠️ *Внимание!*
+
+Зафиксировано ухудшение самочувствия два дня подряд.
+
+Рекомендуется обратиться к врачу."""
+            
+            await self.safe_send_message(
+                user_id,
+                warning_text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👨‍⚕️ Записаться", callback_data="about")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        mood_texts = {
+            1: "😢 Очень плохо. Берегите себя!",
+            2: "🙁 Плохо. Надеюсь, скоро станет лучше!",
+            3: "😐 Нормально. Это уже хорошо!",
+            4: "🙂 Хорошо! Отличное настроение!",
+            5: "😊 Отлично! Так держать!"
+        }
+        
+        keyboard = [
+            [InlineKeyboardButton("🩺 Отметить симптомы", callback_data="symptoms"),
+             InlineKeyboardButton("❌ Нет", callback_data="start")],
+        ]
+        
+        await self.safe_edit_message(query, f"✅ {mood_texts[mood_score]}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def timezone_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, tz_name: str):
+        """Установка часового пояса."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        await TimeUtils.set_user_timezone(user_id, tz_name)
+        
+        await self.safe_edit_message(
+            query,
+            f"✅ *Часовой пояс установлен*\n\nВаш часовой пояс: *{tz_name}*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data="start")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # ============== ЛЕКАРСТВА ==============
+    
+    async def add_medicine_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало добавления лекарства."""
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            edit_func = query.edit_message_text
+        else:
+            edit_func = update.message.reply_text
+        
+        context.user_data['medicine_data'] = {}
+        
+        await edit_func("💊 *Добавление лекарства*\n\nШаг 1: Введите *название лекарства*", parse_mode=ParseMode.MARKDOWN)
+        return States.MEDICINE_NAME
+    
+    async def medicine_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Получение названия лекарства."""
+        if SecurityManager.check_sql_injection(update.message.text):
+            await update.message.reply_text("❌ Обнаружены недопустимые символы")
+            return States.MEDICINE_NAME
+        
+        is_valid, error_msg = SecurityManager.validate_medicine_name(update.message.text)
+        if not is_valid:
+            await update.message.reply_text(f"❌ {error_msg}")
+            return States.MEDICINE_NAME
+        
+        context.user_data['medicine_data']['name'] = SecurityManager.sanitize_input(update.message.text)
+        
+        keyboard = [[InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_dosage")]]
+        await update.message.reply_text(
+            "Шаг 2: Укажите *дозировку* (или нажмите Пропустить)", 
+            reply_markup=InlineKeyboardMarkup(keyboard), 
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.MEDICINE_DOSAGE
+    
+    async def medicine_dosage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Получение дозировки."""
+        if SecurityManager.check_sql_injection(update.message.text):
+            await update.message.reply_text("❌ Обнаружены недопустимые символы")
+            return States.MEDICINE_DOSAGE
+        
+        context.user_data['medicine_data']['dosage'] = SecurityManager.sanitize_input(update.message.text)
+        
+        keyboard = [
+            [InlineKeyboardButton("1 раз", callback_data="times_1"),
+             InlineKeyboardButton("2 раза", callback_data="times_2"),
+             InlineKeyboardButton("3 раза", callback_data="times_3")],
+            [InlineKeyboardButton("4 раза", callback_data="times_4"),
+             InlineKeyboardButton("5 раз", callback_data="times_5"),
+             InlineKeyboardButton("6 раз", callback_data="times_6")]
+        ]
+        await update.message.reply_text(
+            "Шаг 3: Сколько раз в день принимать?", 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.MEDICINE_TIMES_PER_DAY
+    
+    async def skip_dosage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пропуск дозировки."""
         query = update.callback_query
         await query.answer()
         
-        data = query.data
-        
-        if data == "main_menu":
-            await self.start(update, context)
-        elif data == "subscription":
-            await self.show_subscription(update, context)
-        elif data == "buy":
-            await self.buy_subscription(update, context)
-        elif data == "tenant_panel":
-            await self.tenant_panel(update, context)
-        elif data == "setup_tenant":
-            await self.tenant_setup(update, context)
-        elif data == "renew":
-            # Продление подписки
-            context.user_data["selected_plan"] = "premium"
-            await self.select_period(update, context)
+        if 'medicine_data' in context.user_data:
+            context.user_data['medicine_data']['dosage'] = None
+            
+            keyboard = [
+                [InlineKeyboardButton("1 раз", callback_data="times_1"),
+                 InlineKeyboardButton("2 раза", callback_data="times_2"),
+                 InlineKeyboardButton("3 раза", callback_data="times_3")],
+                [InlineKeyboardButton("4 раза", callback_data="times_4"),
+                 InlineKeyboardButton("5 раз", callback_data="times_5"),
+                 InlineKeyboardButton("6 раз", callback_data="times_6")]
+            ]
+            await self.safe_edit_message(
+                query, 
+                "Шаг 3: Сколько раз в день принимать?", 
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.MEDICINE_TIMES_PER_DAY
+        else:
+            context.user_data['unscheduled_dosage'] = None
+            await self.safe_edit_message(
+                query,
+                "💊 *Причина приема?*",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_reason")]
+                ])
+            )
+            return States.UNSCHEDULED_MEDICINE_REASON
     
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена операции."""
-        await update.message.reply_text(
-            "❌ Операция отменена",
+    async def medicine_times_per_day(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор количества приемов."""
+        query = update.callback_query
+        await query.answer()
+        
+        times = int(query.data.replace("times_", ""))
+        context.user_data['medicine_data']['times_per_day'] = times
+        context.user_data['medicine_data']['schedule_times'] = []
+        
+        if times == 2:
+            keyboard = [[InlineKeyboardButton("8:00, 20:00", callback_data="use_default_times")]]
+        elif times == 3:
+            keyboard = [[InlineKeyboardButton("8:00, 14:00, 20:00", callback_data="use_default_times")]]
+        else:
+            keyboard = []
+        
+        keyboard.append([InlineKeyboardButton("⚙️ Своё время", callback_data="hour_select")])
+        
+        await self.safe_edit_message(
+            query,
+            f"Шаг 4: Выберите время приема",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.MEDICINE_SCHEDULE_HOUR
+    
+    async def use_default_times(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Использование стандартного времени."""
+        query = update.callback_query
+        await query.answer()
+        
+        times = context.user_data['medicine_data']['times_per_day']
+        default_times = {
+            2: ["08:00", "20:00"],
+            3: ["08:00", "14:00", "20:00"]
+        }.get(times, [])
+        
+        context.user_data['medicine_data']['schedule_times'] = default_times
+        
+        await self.show_course_duration(query, context)
+        return States.MEDICINE_COURSE_DURATION
+    
+    async def medicine_schedule_hour(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор часа."""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "hour_select":
+            keyboard = []
+            for start in range(0, 24, 6):
+                row = []
+                for h in range(start, min(start + 6, 24)):
+                    row.append(InlineKeyboardButton(f"{h:02d}", callback_data=f"hour_{h:02d}"))
+                keyboard.append(row)
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="add_medicine")])
+            
+            await self.safe_edit_message(
+                query,
+                "Выберите час:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.MEDICINE_SCHEDULE_HOUR
+        
+        hour = query.data.replace("hour_", "")
+        context.user_data['temp_hour'] = hour
+        
+        minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
+        keyboard = []
+        for i in range(0, len(minutes), 4):
+            row = [InlineKeyboardButton(f"{m:02d}", callback_data=f"minute_{m:02d}") for m in minutes[i:i+4]]
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("⏰ К выбору часа", callback_data="back_to_hours")])
+        
+        await self.safe_edit_message(
+            query,
+            f"Вы выбрали час {hour}. Теперь выберите минуты:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.MEDICINE_SCHEDULE_MINUTE
+    
+    async def medicine_schedule_minute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор минут."""
+        query = update.callback_query
+        await query.answer()
+        
+        minute = query.data.replace("minute_", "")
+        hour = context.user_data.get('temp_hour', "00")
+        time_str = f"{hour}:{minute}"
+        
+        times = context.user_data['medicine_data']['schedule_times']
+        times.append(time_str)
+        context.user_data['medicine_data']['schedule_times'] = times
+        
+        if len(times) < context.user_data['medicine_data']['times_per_day']:
+            # Продолжаем выбор
+            keyboard = []
+            for start in range(0, 24, 6):
+                row = []
+                for h in range(start, min(start + 6, 24)):
+                    row.append(InlineKeyboardButton(f"{h:02d}", callback_data=f"hour_{h:02d}"))
+                keyboard.append(row)
+            
+            await self.safe_edit_message(
+                query,
+                f"Выберите час для следующего приема ({len(times)}/{context.user_data['medicine_data']['times_per_day']}):",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.MEDICINE_SCHEDULE_HOUR
+        else:
+            await self.show_course_duration(query, context)
+            return States.MEDICINE_COURSE_DURATION
+    
+    async def back_to_hours(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Возврат к часам."""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = []
+        for start in range(0, 24, 6):
+            row = []
+            for h in range(start, min(start + 6, 24)):
+                row.append(InlineKeyboardButton(f"{h:02d}", callback_data=f"hour_{h:02d}"))
+            keyboard.append(row)
+        
+        await self.safe_edit_message(
+            query,
+            "Выберите час:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.MEDICINE_SCHEDULE_HOUR
+    
+    async def show_course_duration(self, query, context):
+        """Показать выбор длительности курса."""
+        await self.safe_edit_message(
+            query,
+            "Шаг 5: Выберите продолжительность курса",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+                [InlineKeyboardButton("📅 3 дня", callback_data="duration_3"),
+                 InlineKeyboardButton("📅 5 дней", callback_data="duration_5"),
+                 InlineKeyboardButton("📅 7 дней", callback_data="duration_7")],
+                [InlineKeyboardButton("📅 10 дней", callback_data="duration_10"),
+                 InlineKeyboardButton("📅 14 дней", callback_data="duration_14"),
+                 InlineKeyboardButton("📅 30 дней", callback_data="duration_30")],
+                [InlineKeyboardButton("⚙️ Свой вариант", callback_data="duration_custom"),
+                 InlineKeyboardButton("∞ Бессрочно", callback_data="duration_unlimited")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def medicine_course_duration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор продолжительности курса."""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data.replace("duration_", "")
+        
+        if data == "custom":
+            await self.safe_edit_message(
+                query,
+                "Введите количество дней (от 1 до 365):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_COURSE_DURATION
+        elif data == "unlimited":
+            context.user_data['medicine_data']['course_duration'] = None
+            
+            await self.safe_edit_message(
+                query,
+                "Шаг 6: Нужно ли повторять курс?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Без повторения", callback_data="repeat_none"),
+                     InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_REPEAT
+        else:
+            context.user_data['medicine_data']['course_duration'] = int(data)
+            
+            await self.safe_edit_message(
+                query,
+                "Шаг 6: Нужно ли повторять курс?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Без повторения", callback_data="repeat_none"),
+                     InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_REPEAT
+    
+    async def medicine_course_duration_custom(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пользовательская продолжительность курса."""
+        is_valid, days, error = SecurityManager.validate_number_input(update.message.text, 1, 365)
+        if not is_valid:
+            await update.message.reply_text(f"❌ {error}")
+            return States.MEDICINE_COURSE_DURATION
+        
+        context.user_data['medicine_data']['course_duration'] = days
+        
+        await update.message.reply_text(
+            "Шаг 6: Нужно ли повторять курс?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Без повторения", callback_data="repeat_none"),
+                 InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.MEDICINE_REPEAT
+    
+    async def medicine_repeat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор повторения."""
+        query = update.callback_query
+        await query.answer()
+        
+        repeat_type = query.data.replace("repeat_", "")
+        
+        if repeat_type == "custom":
+            await self.safe_edit_message(
+                query,
+                "Введите интервал повторения в днях:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_REPEAT_INTERVAL
+        elif repeat_type == "none":
+            context.user_data['medicine_data']['repeat_type'] = 'none'
+            context.user_data['medicine_data']['repeat_interval'] = None
+            
+            await self.show_start_date(query, context)
+            return States.MEDICINE_START_TYPE
+    
+    async def medicine_repeat_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка интервала повторения."""
+        is_valid, interval, error = SecurityManager.validate_number_input(update.message.text, 1, 365)
+        if not is_valid:
+            await update.message.reply_text(f"❌ {error}")
+            return States.MEDICINE_REPEAT_INTERVAL
+        
+        context.user_data['medicine_data']['repeat_type'] = 'custom'
+        context.user_data['medicine_data']['repeat_interval'] = interval
+        
+        await update.message.reply_text(
+            "Шаг 7: Выберите дату начала",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 Сегодня", callback_data="start_today"),
+                 InlineKeyboardButton("📅 Завтра", callback_data="start_tomorrow")],
+                [InlineKeyboardButton("📅 Выбрать дату", callback_data="start_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.MEDICINE_START_TYPE
+    
+    async def show_start_date(self, query, context):
+        """Показать выбор даты начала."""
+        await self.safe_edit_message(
+            query,
+            "Шаг 7: Выберите дату начала",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 Сегодня", callback_data="start_today"),
+                 InlineKeyboardButton("📅 Завтра", callback_data="start_tomorrow")],
+                [InlineKeyboardButton("📅 Выбрать дату", callback_data="start_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def medicine_start_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор даты начала."""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        tz_name = await TimeUtils.get_user_timezone(user_id)
+        tz = pytz.timezone(tz_name)
+        now = datetime.now(tz)
+        
+        if query.data == "start_today":
+            context.user_data['medicine_data']['start_date'] = now
+            await self.show_medicine_confirmation(update, context)
+        elif query.data == "start_tomorrow":
+            context.user_data['medicine_data']['start_date'] = now + timedelta(days=1)
+            await self.show_medicine_confirmation(update, context)
+        elif query.data == "start_custom":
+            await self.safe_edit_message(
+                query,
+                "Введите дату начала в формате *ДД.ММ.ГГГГ*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_START_DATE
+        
+        return States.MEDICINE_CONFIRM
+    
+    async def medicine_start_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пользовательская дата."""
+        user_id = update.effective_user.id
+        tz_name = await TimeUtils.get_user_timezone(user_id)
+        
+        try:
+            date = TimeUtils.parse_date(update.message.text.strip(), tz_name)
+            if not date:
+                raise ValueError("Неверный формат даты")
+            
+            context.user_data['medicine_data']['start_date'] = date
+            await self.show_medicine_confirmation(update, context)
+            return States.MEDICINE_CONFIRM
+        except Exception:
+            await update.message.reply_text(
+                "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
+            )
+            return States.MEDICINE_START_DATE
+    
+    async def show_medicine_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показ подтверждения для лекарства."""
+        data = context.user_data['medicine_data']
+        start_date = data['start_date']
+        date_str = start_date.strftime('%d.%m.%Y %H:%M')
+        
+        text = f"""✅ *Проверьте данные:*
+
+💊 *Название:* {data['name']}
+💧 *Дозировка:* {data.get('dosage', 'не указана')}
+📊 *Приемов в день:* {data['times_per_day']}
+⏰ *Расписание:* {', '.join(data['schedule_times'])}"""
+
+        if data.get('course_duration'):
+            text += f"\n📅 *Длительность:* {data['course_duration']} дней"
+        else:
+            text += "\n📅 *Длительность:* бессрочно"
+        
+        if data.get('repeat_type') != 'none' and data.get('repeat_interval'):
+            text += f"\n🔄 *Повторение:* каждые {data['repeat_interval']} дней"
+        
+        text += f"\n📆 *Дата начала:* {date_str}\n\nВсё верно?"
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Добавить", callback_data="confirm_medicine"),
+             InlineKeyboardButton("✏️ Редактировать", callback_data="edit_medicine")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
+        ]
+        
+        if update.callback_query:
+            await self.safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def medicine_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подтверждение добавления лекарства."""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        tz_name = await TimeUtils.get_user_timezone(user_id)
+        data = context.user_data['medicine_data']
+        
+        try:
+            # Сохраняем лекарство
+            medicine_id = await db.fetchval("""
+                INSERT INTO medicines (
+                    user_id, name, dosage, times_per_day, schedule_times,
+                    schedule, course_duration, repeat_type, repeat_interval,
+                    start_date, user_timezone, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active')
+                RETURNING id
+            """,
+                user_id,
+                data['name'],
+                data.get('dosage'),
+                data['times_per_day'],
+                json.dumps(data['schedule_times']),
+                ','.join(data['schedule_times']),
+                data.get('course_duration'),
+                data.get('repeat_type', 'none'),
+                data.get('repeat_interval'),
+                data['start_date'],
+                tz_name
+            )
+            
+            # Создаем напоминания
+            for time_str in data['schedule_times']:
+                scheduled_utc = TimeUtils.local_to_utc(time_str, tz_name, data['start_date'])
+                
+                reminder_id = await db.fetchval("""
+                    INSERT INTO reminders (
+                        user_id, reminder_type, item_id, scheduled_time, user_timezone, status
+                    ) VALUES ($1, 'medicine', $2, $3, $4, 'pending')
+                    RETURNING id
+                """, user_id, medicine_id, scheduled_utc, tz_name)
+                
+                job_id = f"medicine_{reminder_id}"
+                scheduler.scheduler.add_job(
+                    scheduler.send_reminder,
+                    trigger=DateTrigger(run_date=scheduled_utc),
+                    id=job_id,
+                    args=[reminder_id],
+                    replace_existing=True
+                )
+            
+            logger.log('info', f"Добавлено лекарство {medicine_id}")
+            
+            keyboard = [
+                [InlineKeyboardButton("📋 Список", callback_data="list_medicines"),
+                 InlineKeyboardButton("➕ Добавить еще", callback_data="add_medicine")],
+                [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+            ]
+            
+            await self.safe_edit_message(
+                query,
+                "✅ *Лекарство успешно добавлено!*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.log_error(e, {'user_id': user_id})
+            await self.safe_edit_message(
+                query,
+                "❌ *Ошибка при добавлении*\n\nПожалуйста, попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главная", callback_data="start")]])
+            )
+        
+        context.user_data.pop('medicine_data', None)
+        return ConversationHandler.END
+    
+    async def medicine_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Редактирование лекарства."""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = [
+            [InlineKeyboardButton("📝 Название", callback_data="edit_field_name"),
+             InlineKeyboardButton("💧 Дозировка", callback_data="edit_field_dosage")],
+            [InlineKeyboardButton("⏰ Расписание", callback_data="edit_field_schedule"),
+             InlineKeyboardButton("📅 Длительность", callback_data="edit_field_course")],
+            [InlineKeyboardButton("🔄 Повторение", callback_data="edit_field_repeat"),
+             InlineKeyboardButton("📆 Дата начала", callback_data="edit_field_start")],
+            [InlineKeyboardButton("✅ Готово", callback_data="confirm_medicine")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            "✏️ *Редактирование*\n\nВыберите, что хотите изменить:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.MEDICINE_EDIT
+    
+    async def medicine_edit_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Редактирование поля."""
+        query = update.callback_query
+        await query.answer()
+        
+        field = query.data.replace("edit_field_", "")
+        
+        if field == "name":
+            await self.safe_edit_message(query, "Введите новое название:")
+            return States.MEDICINE_NAME
+        elif field == "dosage":
+            await self.safe_edit_message(query, "Введите новую дозировку:")
+            return States.MEDICINE_DOSAGE
+        elif field == "schedule":
+            keyboard = [
+                [InlineKeyboardButton("1 раз", callback_data="times_1"),
+                 InlineKeyboardButton("2 раза", callback_data="times_2"),
+                 InlineKeyboardButton("3 раза", callback_data="times_3")],
+                [InlineKeyboardButton("4 раза", callback_data="times_4"),
+                 InlineKeyboardButton("5 раз", callback_data="times_5"),
+                 InlineKeyboardButton("6 раз", callback_data="times_6")]
+            ]
+            await self.safe_edit_message(
+                query,
+                "Выберите новое расписание:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.MEDICINE_TIMES_PER_DAY
+        elif field == "course":
+            await self.safe_edit_message(
+                query,
+                "Выберите новую продолжительность:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📅 3 дня", callback_data="duration_3"),
+                     InlineKeyboardButton("📅 5 дней", callback_data="duration_5"),
+                     InlineKeyboardButton("📅 7 дней", callback_data="duration_7")],
+                    [InlineKeyboardButton("📅 10 дней", callback_data="duration_10"),
+                     InlineKeyboardButton("📅 14 дней", callback_data="duration_14"),
+                     InlineKeyboardButton("📅 30 дней", callback_data="duration_30")],
+                    [InlineKeyboardButton("⚙️ Свой вариант", callback_data="duration_custom"),
+                     InlineKeyboardButton("∞ Бессрочно", callback_data="duration_unlimited")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_COURSE_DURATION
+        elif field == "repeat":
+            await self.safe_edit_message(
+                query,
+                "Выберите новое повторение:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Без повторения", callback_data="repeat_none"),
+                     InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_REPEAT
+        elif field == "start":
+            await self.safe_edit_message(
+                query,
+                "Выберите новую дату начала:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📅 Сегодня", callback_data="start_today"),
+                     InlineKeyboardButton("📅 Завтра", callback_data="start_tomorrow")],
+                    [InlineKeyboardButton("📅 Выбрать дату", callback_data="start_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.MEDICINE_START_TYPE
+        
+        return States.MEDICINE_EDIT
+    
+    async def medicine_comment_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранение комментария."""
+        comment = update.message.text
+        medicine_id = context.user_data.get('comment_medicine_id')
+        
+        if medicine_id:
+            await db.execute("""
+                INSERT INTO medicine_logs (medicine_id, user_id, log_type, status, comment, taken_at)
+                VALUES ($1, $2, 'scheduled', 'comment', $3, CURRENT_TIMESTAMP)
+            """, medicine_id, update.effective_user.id, comment)
+            
+            await update.message.reply_text(
+                "✅ Комментарий сохранен",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Ошибка сохранения",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+                ])
+            )
+        
+        return ConversationHandler.END
+    
+    # ============== АНАЛИЗЫ ==============
+    
+    async def add_analysis_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало добавления анализа."""
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            edit_func = query.edit_message_text
+        else:
+            edit_func = update.message.reply_text
+        
+        context.user_data['analysis_data'] = {}
+        
+        await edit_func(
+            "🩺 *Добавление анализа*\n\nВыберите тип:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🩸 Анализ", callback_data="analysis_type_analysis"),
+                 InlineKeyboardButton("🔬 Исследование", callback_data="analysis_type_investigation")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_TYPE
+    
+    async def analysis_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор типа анализа."""
+        query = update.callback_query
+        await query.answer()
+        
+        analysis_type = query.data.replace("analysis_type_", "")
+        context.user_data['analysis_data']['type'] = analysis_type
+        
+        await self.safe_edit_message(
+            query,
+            f"Шаг 1: Введите *название {'анализа' if analysis_type == 'analysis' else 'исследования'}*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_NAME
+    
+    async def analysis_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Получение названия анализа."""
+        if SecurityManager.check_sql_injection(update.message.text):
+            await update.message.reply_text("❌ Обнаружены недопустимые символы")
+            return States.ANALYSIS_NAME
+        
+        context.user_data['analysis_data']['name'] = SecurityManager.sanitize_input(update.message.text)
+        
+        await update.message.reply_text(
+            "Шаг 2: Выберите *дату*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 Сегодня", callback_data="analysis_date_today"),
+                 InlineKeyboardButton("📅 Завтра", callback_data="analysis_date_tomorrow")],
+                [InlineKeyboardButton("📅 Послезавтра", callback_data="analysis_date_dayafter"),
+                 InlineKeyboardButton("📅 Выбрать дату", callback_data="analysis_date_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_DATE
+    
+    async def analysis_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора даты."""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        tz_name = await TimeUtils.get_user_timezone(user_id)
+        tz = pytz.timezone(tz_name)
+        now = datetime.now(tz)
+        
+        if query.data == "analysis_date_today":
+            context.user_data['analysis_data']['scheduled_date'] = now
+        elif query.data == "analysis_date_tomorrow":
+            context.user_data['analysis_data']['scheduled_date'] = now + timedelta(days=1)
+        elif query.data == "analysis_date_dayafter":
+            context.user_data['analysis_data']['scheduled_date'] = now + timedelta(days=2)
+        elif query.data == "analysis_date_custom":
+            await self.safe_edit_message(
+                query,
+                "Введите дату в формате *ДД.ММ.ГГГГ*",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_DATE
+        
+        # Показываем выбор времени
+        keyboard = [
+            [InlineKeyboardButton("08:00", callback_data="analysis_hour_08"),
+             InlineKeyboardButton("09:00", callback_data="analysis_hour_09"),
+             InlineKeyboardButton("10:00", callback_data="analysis_hour_10"),
+             InlineKeyboardButton("11:00", callback_data="analysis_hour_11")],
+            [InlineKeyboardButton("12:00", callback_data="analysis_hour_12"),
+             InlineKeyboardButton("13:00", callback_data="analysis_hour_13"),
+             InlineKeyboardButton("14:00", callback_data="analysis_hour_14"),
+             InlineKeyboardButton("15:00", callback_data="analysis_hour_15")],
+            [InlineKeyboardButton("16:00", callback_data="analysis_hour_16"),
+             InlineKeyboardButton("17:00", callback_data="analysis_hour_17"),
+             InlineKeyboardButton("18:00", callback_data="analysis_hour_18"),
+             InlineKeyboardButton("19:00", callback_data="analysis_hour_19")],
+            [InlineKeyboardButton("20:00", callback_data="analysis_hour_20"),
+             InlineKeyboardButton("21:00", callback_data="analysis_hour_21"),
+             InlineKeyboardButton("⚙️ Своё время", callback_data="analysis_time_custom")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            "Шаг 3: Выберите *время*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_TIME_HOUR
+    
+    async def analysis_date_custom(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пользовательская дата."""
+        user_id = update.effective_user.id
+        tz_name = await TimeUtils.get_user_timezone(user_id)
+        
+        try:
+            date = TimeUtils.parse_date(update.message.text.strip(), tz_name)
+            if not date:
+                raise ValueError("Неверный формат даты")
+            
+            context.user_data['analysis_data']['scheduled_date'] = date
+            
+            # Показываем выбор времени
+            keyboard = [
+                [InlineKeyboardButton("08:00", callback_data="analysis_hour_08"),
+                 InlineKeyboardButton("09:00", callback_data="analysis_hour_09"),
+                 InlineKeyboardButton("10:00", callback_data="analysis_hour_10"),
+                 InlineKeyboardButton("11:00", callback_data="analysis_hour_11")],
+                [InlineKeyboardButton("12:00", callback_data="analysis_hour_12"),
+                 InlineKeyboardButton("13:00", callback_data="analysis_hour_13"),
+                 InlineKeyboardButton("14:00", callback_data="analysis_hour_14"),
+                 InlineKeyboardButton("15:00", callback_data="analysis_hour_15")],
+                [InlineKeyboardButton("16:00", callback_data="analysis_hour_16"),
+                 InlineKeyboardButton("17:00", callback_data="analysis_hour_17"),
+                 InlineKeyboardButton("18:00", callback_data="analysis_hour_18"),
+                 InlineKeyboardButton("19:00", callback_data="analysis_hour_19")],
+                [InlineKeyboardButton("20:00", callback_data="analysis_hour_20"),
+                 InlineKeyboardButton("21:00", callback_data="analysis_hour_21"),
+                 InlineKeyboardButton("⚙️ Своё время", callback_data="analysis_time_custom")]
+            ]
+            
+            await update.message.reply_text(
+                "Шаг 3: Выберите *время*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_TIME_HOUR
+            
+        except Exception as e:
+            await update.message.reply_text(
+                "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="add_analysis")]])
+            )
+            return States.ANALYSIS_DATE
+    
+    async def analysis_time_hour(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор часа."""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "analysis_time_custom":
+            # Показываем выбор всех часов
+            keyboard = []
+            for start in range(0, 24, 6):
+                row = []
+                for h in range(start, min(start + 6, 24)):
+                    row.append(InlineKeyboardButton(f"{h:02d}", callback_data=f"analysis_hour_{h:02d}"))
+                keyboard.append(row)
+            
+            await self.safe_edit_message(
+                query,
+                "Выберите час:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.ANALYSIS_TIME_HOUR
+        
+        hour = query.data.replace("analysis_hour_", "")
+        context.user_data['temp_hour'] = hour
+        
+        # Показываем выбор минут
+        minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
+        keyboard = []
+        for i in range(0, len(minutes), 4):
+            row = [InlineKeyboardButton(f"{m:02d}", callback_data=f"minute_{m:02d}") for m in minutes[i:i+4]]
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("⏰ К выбору часа", callback_data="back_to_analysis_hours")])
+        
+        await self.safe_edit_message(
+            query,
+            f"Вы выбрали час {hour}. Теперь выберите минуты:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.ANALYSIS_TIME_MINUTE
+    
+    async def analysis_time_minute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор минут."""
+        query = update.callback_query
+        await query.answer()
+        
+        minute = query.data.replace("minute_", "")
+        hour = context.user_data.get('temp_hour', '12')
+        scheduled_time = f"{hour}:{minute}"
+        context.user_data['analysis_data']['scheduled_time'] = scheduled_time
+        
+        # Проверка на дубликат
+        existing = await db.fetchval("""
+            SELECT id FROM analyses 
+            WHERE user_id = $1 
+                AND status = 'pending' 
+                AND scheduled_date::date = $2::date 
+                AND scheduled_time = $3
+        """, update.effective_user.id, 
+            context.user_data['analysis_data']['scheduled_date'],
+            scheduled_time
+        )
+        
+        if existing:
+            analysis_type = "анализ" if context.user_data['analysis_data']['type'] == 'analysis' else 'исследование'
+            
+            keyboard = [
+                [InlineKeyboardButton("⏰ Другое время", callback_data="analysis_time_other"),
+                 InlineKeyboardButton("✅ Все равно создать", callback_data="analysis_force_create")]
+            ]
+            
+            await self.safe_edit_message(
+                query,
+                f"⚠️ *Внимание!*\n\nНа эту дату и время уже запланирован {analysis_type}.\n\nВы можете выбрать другое время или создать дубликат.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_TIME_HOUR
+        
+        await self.safe_edit_message(
+            query,
+            "Шаг 4: Выберите *повторение*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🕐 Одноразово", callback_data="repeat_once"),
+                 InlineKeyboardButton("📅 Ежедневно", callback_data="repeat_daily")],
+                [InlineKeyboardButton("📆 Еженедельно", callback_data="repeat_weekly"),
+                 InlineKeyboardButton("🗓️ Ежемесячно", callback_data="repeat_monthly")],
+                [InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_REPEAT
+    
+    async def back_to_analysis_hours(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Возврат к часам."""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = []
+        for start in range(0, 24, 6):
+            row = []
+            for h in range(start, min(start + 6, 24)):
+                row.append(InlineKeyboardButton(f"{h:02d}", callback_data=f"analysis_hour_{h:02d}"))
+            keyboard.append(row)
+        
+        await self.safe_edit_message(
+            query,
+            "Выберите час:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return States.ANALYSIS_TIME_HOUR
+    
+    async def analysis_time_custom(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка пользовательского времени."""
+        query = update.callback_query
+        await query.answer()
+        
+        await self.analysis_time_hour(update, context)
+    
+    async def analysis_force_create(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Принудительное создание дубликата."""
+        query = update.callback_query
+        await query.answer()
+        
+        await self.safe_edit_message(
+            query,
+            "Шаг 4: Выберите *повторение*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🕐 Одноразово", callback_data="repeat_once"),
+                 InlineKeyboardButton("📅 Ежедневно", callback_data="repeat_daily")],
+                [InlineKeyboardButton("📆 Еженедельно", callback_data="repeat_weekly"),
+                 InlineKeyboardButton("🗓️ Ежемесячно", callback_data="repeat_monthly")],
+                [InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_REPEAT
+    
+    async def analysis_repeat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор повторения."""
+        query = update.callback_query
+        await query.answer()
+        
+        repeat_type = query.data.replace("repeat_", "")
+        
+        repeat_map = {
+            "once": "once",
+            "daily": "daily",
+            "weekly": "weekly",
+            "monthly": "monthly",
+            "custom": "custom"
+        }
+        
+        context.user_data['analysis_data']['repeat_type'] = repeat_map.get(repeat_type, "once")
+        
+        if repeat_type == "custom":
+            await self.safe_edit_message(
+                query,
+                "Введите интервал повторения в днях:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_REPEAT_INTERVAL
+        
+        # Показываем выбор напоминания
+        await self.safe_edit_message(
+            query,
+            "Шаг 5: *Когда напомнить?*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("15 мин", callback_data="remind_15"),
+                 InlineKeyboardButton("30 мин", callback_data="remind_30"),
+                 InlineKeyboardButton("1 час", callback_data="remind_60")],
+                [InlineKeyboardButton("3 часа", callback_data="remind_180"),
+                 InlineKeyboardButton("12 часов", callback_data="remind_720"),
+                 InlineKeyboardButton("24 часа", callback_data="remind_1440")],
+                [InlineKeyboardButton("⚙️ Свой вариант", callback_data="remind_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_REMINDER
+    
+    async def analysis_repeat_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка интервала повторения."""
+        is_valid, interval, error = SecurityManager.validate_number_input(update.message.text, 1, 365)
+        if not is_valid:
+            await update.message.reply_text(f"❌ {error}")
+            return States.ANALYSIS_REPEAT_INTERVAL
+        
+        context.user_data['analysis_data']['repeat_type'] = 'custom'
+        context.user_data['analysis_data']['repeat_interval'] = interval
+        
+        await update.message.reply_text(
+            "Шаг 5: *Когда напомнить?*",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("15 мин", callback_data="remind_15"),
+                 InlineKeyboardButton("30 мин", callback_data="remind_30"),
+                 InlineKeyboardButton("1 час", callback_data="remind_60")],
+                [InlineKeyboardButton("3 часа", callback_data="remind_180"),
+                 InlineKeyboardButton("12 часов", callback_data="remind_720"),
+                 InlineKeyboardButton("24 часа", callback_data="remind_1440")],
+                [InlineKeyboardButton("⚙️ Свой вариант", callback_data="remind_custom")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_REMINDER
+    
+    async def analysis_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор напоминания."""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "remind_custom":
+            await self.safe_edit_message(
+                query,
+                "Введите количество минут:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_REMINDER
+        
+        minutes = int(query.data.replace("remind_", ""))
+        context.user_data['analysis_data']['reminder_before'] = minutes
+        
+        await self.safe_edit_message(
+            query,
+            "Шаг 6: Введите *заметки* (или нажмите Пропустить)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_notes")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_NOTES
+    
+    async def analysis_notes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка заметок."""
+        if SecurityManager.check_sql_injection(update.message.text):
+            await update.message.reply_text("❌ Обнаружены недопустимые символы")
+            return States.ANALYSIS_NOTES
+        
+        context.user_data['analysis_data']['notes'] = SecurityManager.sanitize_input(update.message.text)
+        await self.show_analysis_confirmation(update, context)
+        return States.ANALYSIS_CONFIRM
+    
+    async def skip_notes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пропуск заметок."""
+        query = update.callback_query
+        await query.answer()
+        
+        context.user_data['analysis_data']['notes'] = None
+        await self.show_analysis_confirmation(update, context)
+        return States.ANALYSIS_CONFIRM
+    
+    async def show_analysis_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показ подтверждения для анализа."""
+        data = context.user_data['analysis_data']
+        scheduled_date = data['scheduled_date']
+        date_str = scheduled_date.strftime('%d.%m.%Y')
+        analysis_type = "анализ" if data['type'] == 'analysis' else 'исследование'
+        
+        text = f"""✅ *Проверьте данные {analysis_type}а:*
+
+📋 *Название:* {data['name']}
+📅 *Дата:* {date_str}
+⏰ *Время:* {data['scheduled_time']}"""
+
+        if data.get('repeat_type') == 'custom':
+            text += f"\n🔄 *Повторение:* каждые {data['repeat_interval']} дней"
+        elif data.get('repeat_type') != 'once':
+            text += f"\n🔄 *Повторение:* {data['repeat_type']}"
+        
+        text += f"\n⏰ *Напомнить за:* {data['reminder_before']} мин"
+        
+        if data.get('notes'):
+            text += f"\n📝 *Заметки:* {data['notes']}"
+        
+        text += "\n\nВсё верно?"
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Добавить", callback_data="confirm_analysis"),
+             InlineKeyboardButton("✏️ Редактировать", callback_data="edit_analysis")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
+        ]
+        
+        if update.callback_query:
+            await self.safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    
+    async def analysis_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подтверждение добавления анализа."""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        tz_name = await TimeUtils.get_user_timezone(user_id)
+        data = context.user_data['analysis_data']
+        
+        try:
+            hour, minute = map(int, data['scheduled_time'].split(':'))
+            scheduled_datetime = data['scheduled_date'].replace(hour=hour, minute=minute)
+            
+            analysis_id = await db.fetchval("""
+                INSERT INTO analyses (
+                    user_id, analysis_type, name, scheduled_date, scheduled_time,
+                    repeat_type, repeat_interval, reminder_before, notes, user_timezone, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+                RETURNING id
+            """,
+                user_id, data['type'], data['name'], scheduled_datetime, data['scheduled_time'],
+                data['repeat_type'], data.get('repeat_interval'), data['reminder_before'],
+                data.get('notes'), tz_name
+            )
+            
+            reminder_time = scheduled_datetime - timedelta(minutes=data['reminder_before'])
+            
+            if reminder_time > datetime.now(pytz.UTC):
+                reminder_id = await db.fetchval("""
+                    INSERT INTO reminders (
+                        user_id, reminder_type, item_id, scheduled_time, user_timezone, status
+                    ) VALUES ($1, $2, $3, $4, $5, 'pending')
+                    RETURNING id
+                """, user_id, data['type'], analysis_id, reminder_time, tz_name)
+                
+                job_id = f"{data['type']}_{reminder_id}"
+                scheduler.scheduler.add_job(
+                    scheduler.send_reminder,
+                    trigger=DateTrigger(run_date=reminder_time),
+                    id=job_id,
+                    args=[reminder_id],
+                    replace_existing=True
+                )
+            
+            logger.log('info', f"Добавлен {analysis_type} {analysis_id}")
+            
+            analysis_type = "Анализ" if data['type'] == 'analysis' else 'Исследование'
+            
+            keyboard = [
+                [InlineKeyboardButton("📋 Список", callback_data="list_analyses"),
+                 InlineKeyboardButton("➕ Добавить еще", callback_data="add_analysis")],
+                [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+            ]
+            
+            await self.safe_edit_message(
+                query,
+                f"✅ *{analysis_type} успешно добавлен!*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.log_error(e, {'user_id': user_id})
+            await self.safe_edit_message(
+                query,
+                "❌ *Ошибка при добавлении*\n\nПожалуйста, попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главная", callback_data="start")]])
+            )
+        
+        context.user_data.pop('analysis_data', None)
+        return ConversationHandler.END
+    
+    async def analysis_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Редактирование анализа."""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Название", callback_data="edit_field_analysis_name"),
+             InlineKeyboardButton("📅 Дата", callback_data="edit_field_analysis_date")],
+            [InlineKeyboardButton("⏰ Время", callback_data="edit_field_analysis_time"),
+             InlineKeyboardButton("🔄 Повторение", callback_data="edit_field_analysis_repeat")],
+            [InlineKeyboardButton("⏰ Напоминание", callback_data="edit_field_analysis_reminder"),
+             InlineKeyboardButton("📝 Заметки", callback_data="edit_field_analysis_notes")],
+            [InlineKeyboardButton("✅ Готово", callback_data="confirm_analysis")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            "✏️ *Редактирование анализа*\n\nВыберите, что хотите изменить:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ANALYSIS_EDIT
+    
+    async def analysis_edit_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Редактирование поля анализа."""
+        query = update.callback_query
+        await query.answer()
+        
+        field = query.data.replace("edit_field_analysis_", "")
+        
+        if field == "name":
+            await self.safe_edit_message(query, "Введите новое название:")
+            return States.ANALYSIS_NAME
+        elif field == "date":
+            await self.safe_edit_message(
+                query,
+                "Выберите новую дату:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📅 Сегодня", callback_data="analysis_date_today"),
+                     InlineKeyboardButton("📅 Завтра", callback_data="analysis_date_tomorrow")],
+                    [InlineKeyboardButton("📅 Послезавтра", callback_data="analysis_date_dayafter"),
+                     InlineKeyboardButton("📅 Выбрать дату", callback_data="analysis_date_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_DATE
+        elif field == "time":
+            keyboard = [
+                [InlineKeyboardButton("08:00", callback_data="analysis_hour_08"),
+                 InlineKeyboardButton("09:00", callback_data="analysis_hour_09"),
+                 InlineKeyboardButton("10:00", callback_data="analysis_hour_10"),
+                 InlineKeyboardButton("11:00", callback_data="analysis_hour_11")],
+                [InlineKeyboardButton("12:00", callback_data="analysis_hour_12"),
+                 InlineKeyboardButton("13:00", callback_data="analysis_hour_13"),
+                 InlineKeyboardButton("14:00", callback_data="analysis_hour_14"),
+                 InlineKeyboardButton("15:00", callback_data="analysis_hour_15")],
+                [InlineKeyboardButton("16:00", callback_data="analysis_hour_16"),
+                 InlineKeyboardButton("17:00", callback_data="analysis_hour_17"),
+                 InlineKeyboardButton("18:00", callback_data="analysis_hour_18"),
+                 InlineKeyboardButton("19:00", callback_data="analysis_hour_19")],
+                [InlineKeyboardButton("20:00", callback_data="analysis_hour_20"),
+                 InlineKeyboardButton("21:00", callback_data="analysis_hour_21"),
+                 InlineKeyboardButton("⚙️ Своё время", callback_data="analysis_time_custom")]
+            ]
+            await self.safe_edit_message(
+                query,
+                "Выберите новое время:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.ANALYSIS_TIME_HOUR
+        elif field == "repeat":
+            await self.safe_edit_message(
+                query,
+                "Выберите новое повторение:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🕐 Одноразово", callback_data="repeat_once"),
+                     InlineKeyboardButton("📅 Ежедневно", callback_data="repeat_daily")],
+                    [InlineKeyboardButton("📆 Еженедельно", callback_data="repeat_weekly"),
+                     InlineKeyboardButton("🗓️ Ежемесячно", callback_data="repeat_monthly")],
+                    [InlineKeyboardButton("⚙️ Свой интервал", callback_data="repeat_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_REPEAT
+        elif field == "reminder":
+            await self.safe_edit_message(
+                query,
+                "Выберите новое время напоминания:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("15 мин", callback_data="remind_15"),
+                     InlineKeyboardButton("30 мин", callback_data="remind_30"),
+                     InlineKeyboardButton("1 час", callback_data="remind_60")],
+                    [InlineKeyboardButton("3 часа", callback_data="remind_180"),
+                     InlineKeyboardButton("12 часов", callback_data="remind_720"),
+                     InlineKeyboardButton("24 часа", callback_data="remind_1440")],
+                    [InlineKeyboardButton("⚙️ Свой вариант", callback_data="remind_custom")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_REMINDER
+        elif field == "notes":
+            await self.safe_edit_message(
+                query,
+                "Введите новые заметки:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return States.ANALYSIS_NOTES
+        
+        return States.ANALYSIS_EDIT
+    
+    # ============== СИМПТОМЫ ==============
+    
+    async def symptoms_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало добавления симптомов."""
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            await self.safe_edit_message(query, "🩺 *Опишите симптом:*", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("🩺 *Опишите симптом:*", parse_mode=ParseMode.MARKDOWN)
+        
+        return States.SYMPTOM_TEXT
+    
+    async def new_symptom(self, update: Update, context: ContextTypes.DEFAULT_TYPE, medicine_id: int):
+        """Добавление нового симптома из напоминания."""
+        query = update.callback_query
+        context.user_data['medicine_context'] = medicine_id
+        await self.safe_edit_message(query, "🩺 *Опишите новый симптом:*", parse_mode=ParseMode.MARKDOWN)
+        return States.SYMPTOM_TEXT
+    
+    async def symptom_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Получение текста симптома."""
+        if SecurityManager.check_sql_injection(update.message.text):
+            await update.message.reply_text("❌ Обнаружены недопустимые символы")
+            return States.SYMPTOM_TEXT
+        
+        context.user_data['symptom_text'] = SecurityManager.sanitize_input(update.message.text)
+        
+        keyboard = [
+            [InlineKeyboardButton("1️⃣ Очень легкий 🟢", callback_data="severity_1"),
+             InlineKeyboardButton("2️⃣ Легкий 💚", callback_data="severity_2")],
+            [InlineKeyboardButton("3️⃣ Умеренный 💛", callback_data="severity_3"),
+             InlineKeyboardButton("4️⃣ Сильный 🧡", callback_data="severity_4")],
+            [InlineKeyboardButton("5️⃣ Максимальный ❤️", callback_data="severity_5")]
+        ]
+        
+        await update.message.reply_text(
+            "🩺 *Оцените тяжесть симптома*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.SYMPTOM_SEVERITY
+    
+    async def symptom_severity(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка тяжести симптома."""
+        query = update.callback_query
+        await query.answer()
+        
+        severity = int(query.data.replace("severity_", ""))
+        symptom = context.user_data.get('symptom_text', 'Не указан')
+        user_id = update.effective_user.id
+        
+        severity_colors = {1: "зеленый", 2: "лимонный", 3: "желтый", 4: "оранжевый", 5: "красный"}
+        
+        await db.execute("""
+            INSERT INTO symptom_logs (user_id, symptom, severity, severity_color)
+            VALUES ($1, $2, $3, $4)
+        """, user_id, symptom, severity, severity_colors[severity])
+        
+        if 'medicine_context' in context.user_data:
+            medicine_id = context.user_data['medicine_context']
+            await db.execute("""
+                INSERT INTO medicine_logs (medicine_id, user_id, status, side_effects, taken_at)
+                VALUES ($1, $2, 'side_effect', $3, CURRENT_TIMESTAMP)
+            """, medicine_id, user_id, symptom)
+        
+        severity_texts = {
+            1: "1️⃣ Очень легкий (зеленый)",
+            2: "2️⃣ Легкий (лимонный)",
+            3: "3️⃣ Умеренный (желтый)",
+            4: "4️⃣ Сильный (оранжевый)",
+            5: "5️⃣ Максимальный (красный)"
+        }
+        
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        await self.safe_edit_message(
+            query,
+            f"✅ *Симптом зафиксирован:*\n\n🤒 {symptom}\n📊 {severity_texts[severity]}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        context.user_data.pop('symptom_text', None)
+        context.user_data.pop('medicine_context', None)
+        return ConversationHandler.END
+    
+    # ============== НЕЗАПЛАНИРОВАННЫЙ ПРИЕМ ==============
+    
+    async def unscheduled_medicine_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало незапланированного приема."""
+        if update.callback_query:
+            query = update.callback_query
+            await query.answer()
+            edit_func = query.edit_message_text
+        else:
+            edit_func = update.message.reply_text
+        
+        user_id = update.effective_user.id
+        
+        medicines = await db.fetch(
+            "SELECT id, name, dosage FROM medicines WHERE user_id = $1 AND status = 'active'",
+            user_id
+        )
+        
+        if not medicines:
+            await edit_func(
+                "❌ *У вас нет активных препаратов*\n\nСначала добавьте препарат в список.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💊 Добавить препарат", callback_data="add_medicine")],
+                    [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+                ]),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return ConversationHandler.END
+        
+        keyboard = []
+        for med in medicines:
+            text = f"💊 {med['name']}" + (f" ({med['dosage']})" if med['dosage'] else "")
+            keyboard.append([InlineKeyboardButton(text, callback_data=f"unscheduled_medicine_{med['id']}")])
+        
+        keyboard.append([InlineKeyboardButton("➕ Новый препарат", callback_data="add_new_medicine")])
+        keyboard.append([InlineKeyboardButton("🏠 Главная", callback_data="start")])
+        
+        await edit_func(
+            "💊 *Принять препарат*\n\nВыберите препарат из списка:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.UNSCHEDULED_MEDICINE_SELECT
+    
+    async def unscheduled_medicine_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор препарата."""
+        query = update.callback_query
+        await query.answer()
+        
+        medicine_id = int(query.data.replace("unscheduled_medicine_", ""))
+        context.user_data['unscheduled_medicine_id'] = medicine_id
+        
+        await self.safe_edit_message(
+            query,
+            "💊 *Укажите принятую дозу*\n(или нажмите Пропустить):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_dosage")]
             ])
+        )
+        return States.UNSCHEDULED_MEDICINE_DOSAGE
+    
+    async def unscheduled_medicine_dosage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Дозировка."""
+        context.user_data['unscheduled_dosage'] = update.message.text
+        
+        await update.message.reply_text(
+            "💊 *Почему был принят препарат?*\n(укажите причину или нажмите Пропустить):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_reason")]
+            ])
+        )
+        return States.UNSCHEDULED_MEDICINE_REASON
+    
+    async def unscheduled_medicine_reason(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Причина приема."""
+        context.user_data['unscheduled_reason'] = update.message.text
+        
+        await update.message.reply_text(
+            "💊 *Добавьте комментарий*\n(или нажмите Пропустить):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_comment")]
+            ])
+        )
+        return States.UNSCHEDULED_MEDICINE_COMMENT
+    
+    async def unscheduled_medicine_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Комментарий."""
+        context.user_data['unscheduled_comment'] = update.message.text
+        await self.save_unscheduled_medicine(update, context)
+        return ConversationHandler.END
+    
+    async def skip_reason(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пропуск причины."""
+        query = update.callback_query
+        await query.answer()
+        
+        context.user_data['unscheduled_reason'] = None
+        
+        await self.safe_edit_message(
+            query,
+            "💊 *Добавьте комментарий*\n(или нажмите Пропустить):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_comment")]
+            ])
+        )
+        return States.UNSCHEDULED_MEDICINE_COMMENT
+    
+    async def skip_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пропуск комментария."""
+        query = update.callback_query
+        await query.answer()
+        
+        context.user_data['unscheduled_comment'] = None
+        await self.save_unscheduled_medicine(update, context)
+        return ConversationHandler.END
+    
+    async def save_unscheduled_medicine(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранение незапланированного приема."""
+        user_id = update.effective_user.id
+        medicine_id = context.user_data['unscheduled_medicine_id']
+        dosage = context.user_data.get('unscheduled_dosage')
+        reason = context.user_data.get('unscheduled_reason')
+        comment = context.user_data.get('unscheduled_comment')
+        
+        # Получаем название препарата
+        medicine = await db.fetchrow(
+            "SELECT name FROM medicines WHERE id = $1",
+            medicine_id
+        )
+        
+        if medicine:
+            await db.execute("""
+                INSERT INTO medicine_logs (
+                    medicine_id, user_id, log_type, status, dosage, reason, comment, taken_at
+                ) VALUES ($1, $2, 'unscheduled', 'taken', $3, $4, $5, CURRENT_TIMESTAMP)
+            """, medicine_id, user_id, dosage, reason, comment)
+            
+            # Увеличиваем счетчик
+            await db.execute("""
+                UPDATE medicines SET total_unscheduled = total_unscheduled + 1, total_taken = total_taken + 1
+                WHERE id = $1
+            """, medicine_id)
+            
+            logger.log('info', f"Незапланированный прием {medicine['name']}")
+        
+        text = f"✅ *Прием зафиксирован*\n\nПрепарат: {medicine['name'] if medicine else 'неизвестный'}"
+        if dosage:
+            text += f"\nДоза: {dosage}"
+        
+        keyboard = [
+            [InlineKeyboardButton("👨‍⚕️ Записаться к врачу", callback_data="about"),
+             InlineKeyboardButton("🏠 Главная", callback_data="start")],
+        ]
+        
+        if update.callback_query:
+            await self.safe_edit_message(update.callback_query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+        for key in ['unscheduled_medicine_id', 'unscheduled_dosage', 'unscheduled_reason', 'unscheduled_comment']:
+            context.user_data.pop(key, None)
+    
+    # ============== ОТКЛАДЫВАНИЕ ==============
+    
+    async def postpone_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE, item_type: str, item_id: int):
+        """Начало откладывания."""
+        query = update.callback_query
+        await query.answer()
+        
+        context.user_data['postpone_item_id'] = item_id
+        context.user_data['postpone_type'] = item_type
+        
+        keyboard = [
+            [InlineKeyboardButton("⏰ Часы", callback_data="postpone_type_hours"),
+             InlineKeyboardButton("📅 Дни", callback_data="postpone_type_days")],
+            [InlineKeyboardButton("⚙️ Свой вариант", callback_data="postpone_custom")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            "⏸ *На сколько отложить?*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.POSTPONE_TYPE
+    
+    async def postpone_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора типа."""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "postpone_type_hours":
+            keyboard = []
+            for start in range(1, 25, 6):
+                row = []
+                for h in range(start, min(start + 6, 25)):
+                    row.append(InlineKeyboardButton(f"{h} ч", callback_data=f"postpone_hour_{h}"))
+                keyboard.append(row)
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
+            
+            await self.safe_edit_message(
+                query,
+                "⏰ *На сколько часов отложить?*",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.POSTPONE_HOURS
+        elif query.data == "postpone_type_days":
+            keyboard = [
+                [InlineKeyboardButton("1 день", callback_data="postpone_day_1"),
+                 InlineKeyboardButton("2 дня", callback_data="postpone_day_2"),
+                 InlineKeyboardButton("3 дня", callback_data="postpone_day_3")],
+                [InlineKeyboardButton("5 дней", callback_data="postpone_day_5"),
+                 InlineKeyboardButton("7 дней", callback_data="postpone_day_7"),
+                 InlineKeyboardButton("10 дней", callback_data="postpone_day_10")],
+                [InlineKeyboardButton("14 дней", callback_data="postpone_day_14"),
+                 InlineKeyboardButton("30 дней", callback_data="postpone_day_30"),
+                 InlineKeyboardButton("⚙️ Свой", callback_data="postpone_custom")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+            ]
+            
+            await self.safe_edit_message(
+                query,
+                "📅 *На сколько дней отложить?*",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return States.POSTPONE_DAYS
+    
+    async def postpone_hours(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор часов."""
+        query = update.callback_query
+        await query.answer()
+        
+        hours = int(query.data.replace("postpone_hour_", ""))
+        await self.execute_postpone(update, context, hours, 'hours')
+        return ConversationHandler.END
+    
+    async def postpone_days(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор дней."""
+        query = update.callback_query
+        await query.answer()
+        
+        days = int(query.data.replace("postpone_day_", ""))
+        await self.execute_postpone(update, context, days, 'days')
+        return ConversationHandler.END
+    
+    async def postpone_custom_value(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пользовательское значение."""
+        is_valid, value, error = SecurityManager.validate_number_input(update.message.text, 1, 365)
+        if not is_valid:
+            await update.message.reply_text(f"❌ {error}")
+            return States.POSTPONE_CUSTOM
+        
+        await self.execute_postpone(update, context, value, 'hours')
+        return ConversationHandler.END
+    
+    async def execute_postpone(self, update: Update, context: ContextTypes.DEFAULT_TYPE, value: int, unit: str):
+        """Выполнение откладывания."""
+        item_id = context.user_data['postpone_item_id']
+        item_type = context.user_data['postpone_type']
+        user_id = update.effective_user.id
+        
+        if unit == 'hours':
+            delta = timedelta(hours=value)
+        else:
+            delta = timedelta(days=value)
+        
+        new_time = datetime.now(pytz.UTC) + delta
+        
+        if item_type == 'medicine':
+            await db.execute(
+                "UPDATE medicines SET total_postponed = total_postponed + 1 WHERE id = $1",
+                item_id
+            )
+            
+            reminder = await db.fetchrow("""
+                SELECT id FROM reminders 
+                WHERE item_id = $1 AND reminder_type = 'medicine' AND status = 'sent'
+                ORDER BY scheduled_time DESC LIMIT 1
+            """, item_id)
+            
+            if reminder:
+                await db.execute(
+                    "UPDATE reminders SET status = 'postponed', postponed_until = $1 WHERE id = $2",
+                    new_time, reminder['id']
+                )
+                
+                new_reminder_id = await db.fetchval("""
+                    INSERT INTO reminders (
+                        user_id, reminder_type, item_id, scheduled_time, user_timezone, status
+                    ) VALUES ($1, 'medicine', $2, $3, $4, 'pending')
+                    RETURNING id
+                """, user_id, item_id, new_time, await TimeUtils.get_user_timezone(user_id))
+                
+                job_id = f"medicine_{new_reminder_id}"
+                scheduler.scheduler.add_job(
+                    scheduler.send_reminder,
+                    trigger=DateTrigger(run_date=new_time),
+                    id=job_id,
+                    args=[new_reminder_id],
+                    replace_existing=True
+                )
+                
+        elif item_type in ['analysis', 'analysis', 'investigation']:
+            await db.execute("""
+                UPDATE analyses SET scheduled_date = $1 WHERE id = $2
+            """, new_time, item_id)
+            
+            analysis = await db.fetchrow(
+                "SELECT reminder_before, analysis_type FROM analyses WHERE id = $1",
+                item_id
+            )
+            
+            if analysis:
+                reminder_time = new_time - timedelta(minutes=analysis['reminder_before'])
+                
+                new_reminder_id = await db.fetchval("""
+                    INSERT INTO reminders (
+                        user_id, reminder_type, item_id, scheduled_time, user_timezone, status
+                    ) VALUES ($1, $2, $3, $4, $5, 'pending')
+                    RETURNING id
+                """, user_id, analysis['analysis_type'], item_id, reminder_time,
+                    await TimeUtils.get_user_timezone(user_id))
+                
+                job_id = f"{analysis['analysis_type']}_{new_reminder_id}"
+                scheduler.scheduler.add_job(
+                    scheduler.send_reminder,
+                    trigger=DateTrigger(run_date=reminder_time),
+                    id=job_id,
+                    args=[new_reminder_id],
+                    replace_existing=True
+                )
+        
+        unit_text = {'hours': 'часов', 'days': 'дней'}.get(unit, unit)
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        
+        await self.safe_edit_message(
+            update.callback_query,
+            f"✅ *Напоминание отложено на {value} {unit_text}*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        context.user_data.pop('postpone_item_id', None)
+        context.user_data.pop('postpone_type', None)
+    
+    # ============== ДЕЙСТВИЯ С НАПОМИНАНИЯМИ ==============
+    
+    async def medicine_take(self, update: Update, context: ContextTypes.DEFAULT_TYPE, medicine_id: int):
+        """Отметка о приеме."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        medicine = await db.fetchrow(
+            "SELECT name FROM medicines WHERE id = $1",
+            medicine_id
+        )
+        
+        if medicine:
+            await db.execute("""
+                UPDATE medicines SET total_taken = total_taken + 1 WHERE id = $1
+            """, medicine_id)
+            
+            await db.execute("""
+                INSERT INTO medicine_logs (medicine_id, user_id, status, taken_at)
+                VALUES ($1, $2, 'taken', CURRENT_TIMESTAMP)
+            """, medicine_id, user_id)
+            
+            await db.execute("""
+                UPDATE reminders SET status = 'completed' 
+                WHERE item_id = $1 AND reminder_type = 'medicine' AND status = 'sent'
+            """, medicine_id)
+        
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        await self.safe_edit_message(
+            query,
+            f"✅ Прием *{medicine['name'] if medicine else 'лекарства'}* отмечен!",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def medicine_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, medicine_id: int):
+        """Отмена приема."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        medicine = await db.fetchrow(
+            "SELECT name FROM medicines WHERE id = $1",
+            medicine_id
+        )
+        
+        if medicine:
+            await db.execute("""
+                UPDATE medicines SET total_skipped = total_skipped + 1 WHERE id = $1
+            """, medicine_id)
+            
+            await db.execute("""
+                INSERT INTO medicine_logs (medicine_id, user_id, status, taken_at)
+                VALUES ($1, $2, 'skipped', CURRENT_TIMESTAMP)
+            """, medicine_id, user_id)
+            
+            await db.execute("""
+                UPDATE reminders SET status = 'skipped' 
+                WHERE item_id = $1 AND reminder_type = 'medicine' AND status = 'sent'
+            """, medicine_id)
+        
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        await self.safe_edit_message(
+            query,
+            f"❌ Прием *{medicine['name'] if medicine else 'лекарства'}* отменен",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def medicine_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE, medicine_id: int):
+        """Комментарий к приему."""
+        query = update.callback_query
+        context.user_data['comment_medicine_id'] = medicine_id
+        await self.safe_edit_message(query, "📝 Введите ваш комментарий:")
+        return States.MEDICINE_COMMENT
+    
+    async def analysis_take(self, update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: int):
+        """Отметка о сдаче анализа."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        analysis = await db.fetchrow(
+            "SELECT name FROM analyses WHERE id = $1",
+            analysis_id
+        )
+        
+        if analysis:
+            await db.execute("""
+                UPDATE analyses SET status = 'completed' WHERE id = $1
+            """, analysis_id)
+            
+            await db.execute("""
+                UPDATE reminders SET status = 'completed' 
+                WHERE item_id = $1 AND reminder_type IN ('analysis', 'investigation') AND status = 'sent'
+            """, analysis_id)
+        
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        await self.safe_edit_message(
+            query,
+            f"✅ Сдача *{analysis['name']}* отмечена!",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def analysis_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: int):
+        """Отмена анализа."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        analysis = await db.fetchrow(
+            "SELECT name, analysis_type FROM analyses WHERE id = $1",
+            analysis_id
+        )
+        
+        if analysis:
+            await db.execute("""
+                UPDATE analyses SET status = 'cancelled' WHERE id = $1
+            """, analysis_id)
+            
+            reminders = await db.fetch("""
+                SELECT id FROM reminders 
+                WHERE item_id = $1 AND reminder_type = $2 AND status = 'pending'
+            """, analysis_id, analysis['analysis_type'])
+            
+            for reminder in reminders:
+                await db.execute(
+                    "UPDATE reminders SET status = 'cancelled' WHERE id = $1",
+                    reminder['id']
+                )
+                try:
+                    scheduler.scheduler.remove_job(f"{analysis['analysis_type']}_{reminder['id']}")
+                except JobLookupError:
+                    pass
+        
+        keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+        await self.safe_edit_message(
+            query,
+            f"❌ Анализ *{analysis['name']}* отменен",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def analysis_notes(self, update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: int):
+        """Заметки к анализу."""
+        query = update.callback_query
+        context.user_data['analysis_notes_id'] = analysis_id
+        await self.safe_edit_message(query, "📝 Введите заметки к анализу:")
+        return States.ANALYSIS_NOTES
+    
+    async def delete_medicine(self, update: Update, context: ContextTypes.DEFAULT_TYPE, medicine_id: int):
+        """Удаление лекарства."""
+        query = update.callback_query
+        await query.answer()
+        
+        medicine = await db.fetchrow(
+            "SELECT name FROM medicines WHERE id = $1",
+            medicine_id
+        )
+        
+        if medicine:
+            await db.execute(
+                "UPDATE medicines SET status = 'deleted' WHERE id = $1",
+                medicine_id
+            )
+            
+            reminders = await db.fetch("""
+                SELECT id FROM reminders 
+                WHERE item_id = $1 AND reminder_type = 'medicine' AND status = 'pending'
+            """, medicine_id)
+            
+            for reminder in reminders:
+                await db.execute(
+                    "UPDATE reminders SET status = 'cancelled' WHERE id = $1",
+                    reminder['id']
+                )
+                try:
+                    scheduler.scheduler.remove_job(f"medicine_{reminder['id']}")
+                except JobLookupError:
+                    pass
+            
+            logger.log('info', f"Удалено лекарство {medicine_id}")
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Список лекарств", callback_data="list_medicines"),
+             InlineKeyboardButton("🏠 Главная", callback_data="start")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            f"✅ Лекарство *{medicine['name']}* удалено",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def delete_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE, analysis_id: int):
+        """Удаление анализа."""
+        query = update.callback_query
+        await query.answer()
+        
+        analysis = await db.fetchrow(
+            "SELECT name, analysis_type FROM analyses WHERE id = $1",
+            analysis_id
+        )
+        
+        if analysis:
+            await db.execute(
+                "UPDATE analyses SET status = 'cancelled' WHERE id = $1",
+                analysis_id
+            )
+            
+            reminders = await db.fetch("""
+                SELECT id FROM reminders 
+                WHERE item_id = $1 AND reminder_type = $2 AND status = 'pending'
+            """, analysis_id, analysis['analysis_type'])
+            
+            for reminder in reminders:
+                await db.execute(
+                    "UPDATE reminders SET status = 'cancelled' WHERE id = $1",
+                    reminder['id']
+                )
+                try:
+                    scheduler.scheduler.remove_job(f"{analysis['analysis_type']}_{reminder['id']}")
+                except JobLookupError:
+                    pass
+            
+            logger.log('info', f"Удален анализ {analysis_id}")
+        
+        analysis_type = "Анализ" if analysis['analysis_type'] == 'analysis' else 'Исследование'
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Список", callback_data="list_analyses"),
+             InlineKeyboardButton("🏠 Главная", callback_data="start")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            f"✅ {analysis_type} *{analysis['name']}* удален",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # ============== СПИСКИ ==============
+    
+    async def list_medicines(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Просмотр списка лекарств."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        page = context.user_data.get('medicines_page', 1)
+        offset = (page - 1) * config.PAGE_SIZE
+        
+        # Общее количество
+        total = await db.fetchval("""
+            SELECT COUNT(*) FROM medicines 
+            WHERE user_id = $1 AND status IN ('active', 'paused')
+        """, user_id)
+        
+        if total == 0:
+            keyboard = [
+                [InlineKeyboardButton("💊 Добавить лекарство", callback_data="add_medicine")],
+                [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+            ]
+            await self.safe_edit_message(
+                query,
+                "📋 *У вас нет активных лекарств*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        medicines = await db.fetch("""
+            SELECT id, name, dosage, schedule, status,
+                   total_taken, total_skipped, total_postponed
+            FROM medicines 
+            WHERE user_id = $1 AND status IN ('active', 'paused')
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+        """, user_id, config.PAGE_SIZE, offset)
+        
+        total_pages = (total + config.PAGE_SIZE - 1) // config.PAGE_SIZE
+        
+        text = f"📋 *Ваши лекарства (стр {page}/{total_pages})*\n\n"
+        keyboard = []
+        
+        for med in medicines:
+            status_emoji = "⏸" if med['status'] == 'paused' else "✅"
+            text += f"{status_emoji} *{med['name']}*"
+            if med['dosage']:
+                text += f" ({med['dosage']})"
+            text += f"\n   ⏰ {med['schedule']}\n"
+            
+            total_count = med['total_taken'] + med['total_skipped'] + med['total_postponed']
+            if total_count > 0:
+                adherence = (med['total_taken'] / total_count * 100)
+                text += f"   📊 Приверженность: {adherence:.1f}%\n"
+            
+            text += "\n"
+            keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {med['name']}", callback_data=f"delete_medicine_{med['id']}")])
+        
+        # Пагинация
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"medicines_page_{page-1}"))
+        nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"medicines_page_{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        
+        keyboard.append([InlineKeyboardButton("💊 Добавить", callback_data="add_medicine")])
+        keyboard.append([InlineKeyboardButton("🏠 Главная", callback_data="start")])
+        
+        await self.safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def list_analyses(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Просмотр списка анализов."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        if query.data == "list_analyses":
+            keyboard = [
+                [InlineKeyboardButton("🩸 Анализы", callback_data="list_analyses_analysis"),
+                 InlineKeyboardButton("🔬 Исследования", callback_data="list_analyses_investigation")],
+                [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+            ]
+            await self.safe_edit_message(
+                query,
+                "📋 *Выберите тип для просмотра:*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        analysis_type = 'analysis' if query.data == "list_analyses_analysis" else 'investigation'
+        type_name = "анализы" if analysis_type == 'analysis' else "исследования"
+        page = context.user_data.get(f'{analysis_type}_page', 1)
+        offset = (page - 1) * config.PAGE_SIZE
+        
+        total = await db.fetchval("""
+            SELECT COUNT(*) FROM analyses 
+            WHERE user_id = $1 AND analysis_type = $2 AND status = 'pending'
+        """, user_id, analysis_type)
+        
+        if total == 0:
+            text = f"📋 *У вас нет запланированных {type_name}*"
+            keyboard = [
+                [InlineKeyboardButton("🩺 Добавить", callback_data="add_analysis")],
+                [InlineKeyboardButton("🔙 К выбору типа", callback_data="list_analyses")],
+                [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+            ]
+            await self.safe_edit_message(
+                query,
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        analyses = await db.fetch("""
+            SELECT id, name, scheduled_date, scheduled_time, notes, user_timezone
+            FROM analyses 
+            WHERE user_id = $1 AND analysis_type = $2 AND status = 'pending'
+            ORDER BY scheduled_date ASC
+            LIMIT $3 OFFSET $4
+        """, user_id, analysis_type, config.PAGE_SIZE, offset)
+        
+        total_pages = (total + config.PAGE_SIZE - 1) // config.PAGE_SIZE
+        text = f"📋 *Запланированные {type_name} (стр {page}/{total_pages})*\n\n"
+        keyboard = []
+        
+        now = datetime.now(pytz.UTC)
+        for analysis in analyses:
+            local_date = TimeUtils.utc_to_local(analysis['scheduled_date'], analysis['user_timezone'])
+            days_left = (analysis['scheduled_date'] - now).days
+            
+            if days_left < 0:
+                status = "🔴 Просрочен"
+            elif days_left == 0:
+                status = "🟡 Сегодня"
+            elif days_left == 1:
+                status = "🟡 Завтра"
+            else:
+                status = f"🟢 Через {days_left} дн."
+            
+            text += f"*{analysis['name']}*\n"
+            text += f"   📅 {local_date.strftime('%d.%m.%Y')} в {analysis['scheduled_time']}\n"
+            text += f"   📊 {status}\n"
+            if analysis['notes']:
+                text += f"   📝 {analysis['notes']}\n"
+            text += "\n"
+            keyboard.append([InlineKeyboardButton(f"🗑️ Удалить {analysis['name']}", callback_data=f"delete_analysis_{analysis['id']}")])
+        
+        # Пагинация
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"analyses_{analysis_type}_page_{page-1}"))
+        nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"analyses_{analysis_type}_page_{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        
+        keyboard.append([InlineKeyboardButton("🩺 Добавить", callback_data="add_analysis")])
+        keyboard.append([InlineKeyboardButton("🔙 К выбору типа", callback_data="list_analyses")])
+        keyboard.append([InlineKeyboardButton("🏠 Главная", callback_data="start")])
+        
+        await self.safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # ============== АДМИН-ПАНЕЛЬ ==============
+    
+    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Админ-панель по команде."""
+        user_id = update.effective_user.id
+        
+        if not await self._check_admin_by_id(user_id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await update.message.reply_text(
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+             InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
+            [InlineKeyboardButton("📝 Логи", callback_data="admin_logs"),
+             InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("💾 Резервное копирование", callback_data="admin_backup"),
+             InlineKeyboardButton("ℹ️ Версия", callback_data="admin_version")],
+            [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+        ]
+        
+        await update.message.reply_text(
+            f"👨‍💻 *Админ-панель*\n\nВерсия: {config.BOT_VERSION}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_panel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Админ-панель по callback."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        if not await self._check_admin_by_id(user_id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+             InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
+            [InlineKeyboardButton("📝 Логи", callback_data="admin_logs"),
+             InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("💾 Резервное копирование", callback_data="admin_backup"),
+             InlineKeyboardButton("ℹ️ Версия", callback_data="admin_version")],
+            [InlineKeyboardButton("🏠 Главная", callback_data="start")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            f"👨‍💻 *Админ-панель*\n\nВерсия: {config.BOT_VERSION}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Админ-статистика."""
+        query = update.callback_query
+        
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        total_users = await db.fetchval("SELECT COUNT(*) FROM users") or 0
+        active_users = await db.fetchval("SELECT COUNT(*) FROM users WHERE status = 'active'") or 0
+        total_medicines = await db.fetchval("SELECT COUNT(*) FROM medicines") or 0
+        total_analyses = await db.fetchval("SELECT COUNT(*) FROM analyses") or 0
+        total_reminders = await db.fetchval("SELECT COUNT(*) FROM reminders WHERE status = 'pending'") or 0
+        
+        text = f"""📊 *Админ-статистика*
+
+👥 *Пользователи:*
+• Всего: {total_users}
+• Активных: {active_users}
+
+💊 *Лекарства:* {total_medicines}
+🩺 *Анализы:* {total_analyses}
+⏰ *Напоминания:* {total_reminders}
+
+🔄 *Система:*
+• Версия: {config.BOT_VERSION}
+• Дата: {config.BOT_VERSION_DATE}"""
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data="admin_stats")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Управление пользователями."""
+        query = update.callback_query
+        
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("📋 Список пользователей", callback_data="admin_users_list")],
+            [InlineKeyboardButton("🔍 Поиск", callback_data="admin_users_search")],
+            [InlineKeyboardButton("🚫 Заблокированные", callback_data="admin_users_banned")],
+            [InlineKeyboardButton("👑 Администраторы", callback_data="admin_users_admins")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            "👥 *Управление пользователями*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_users_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Список пользователей с пагинацией."""
+        query = update.callback_query
+        await query.answer()
+        
+        page = context.user_data.get('admin_users_page', 1)
+        offset = (page - 1) * config.PAGE_SIZE
+        
+        total = await db.fetchval("SELECT COUNT(*) FROM users") or 0
+        users = await db.fetch("""
+            SELECT user_id, username, first_name, last_name, role, status, created_at
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+        """, config.PAGE_SIZE, offset)
+        
+        total_pages = (total + config.PAGE_SIZE - 1) // config.PAGE_SIZE
+        text = f"👥 *Пользователи (стр {page}/{total_pages})*\n\n"
+        keyboard = []
+        
+        for user in users:
+            status_emoji = "🟢" if user['status'] == 'active' else "🔴" if user['status'] == 'banned' else "🟡"
+            role_emoji = "👑" if user['role'] == 'super_admin' else "🔰" if user['role'] == 'admin' else "👤"
+            
+            text += f"{status_emoji}{role_emoji} *{user['first_name']}*"
+            if user['username']:
+                text += f" (@{user['username']})"
+            text += f"\n   🆔 `{user['user_id']}`"
+            text += f"\n   📅 {user['created_at'].strftime('%d.%m.%Y')}\n\n"
+            
+            keyboard.append([InlineKeyboardButton(
+                f"📊 {user['first_name'][:20]}",
+                callback_data=f"admin_user_stats_{user['user_id']}"
+            )])
+        
+        # Пагинация
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"admin_users_page_{page-1}"))
+        nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"admin_users_page_{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_users")])
+        
+        await self.safe_edit_message(
+            query,
+            text[:4000],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_users_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+        """Обработка пагинации."""
+        context.user_data['admin_users_page'] = page
+        await self.admin_users_list(update, context)
+    
+    async def admin_users_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Поиск пользователей."""
+        query = update.callback_query
+        await query.answer()
+        
+        await self.safe_edit_message(
+            query,
+            "🔍 *Поиск пользователей*\n\n"
+            "Введите для поиска:\n"
+            "• ID пользователя\n"
+            "• Username (с @ или без)\n"
+            "• Имя или фамилию\n\n"
+            "Минимум 3 символа:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Показать всех", callback_data="admin_users_list")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.ADMIN_USER_SEARCH
+    
+    async def admin_user_search_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Результаты поиска."""
+        query_text = update.message.text.strip()
+        
+        if len(query_text) < 3 and not query_text.isdigit():
+            await update.message.reply_text(
+                "❌ Слишком короткий запрос. Минимум 3 символа.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data="admin_users_search")]
+                ])
+            )
+            return ConversationHandler.END
+        
+        if query_text.isdigit():
+            users = await db.fetch(
+                "SELECT user_id, username, first_name, role, status FROM users WHERE user_id = $1",
+                int(query_text)
+            )
+        else:
+            clean_query = query_text.lstrip('@').lower()
+            pattern = f"%{clean_query}%"
+            users = await db.fetch("""
+                SELECT user_id, username, first_name, role, status 
+                FROM users 
+                WHERE LOWER(username) LIKE $1 OR LOWER(first_name) LIKE $1 OR LOWER(last_name) LIKE $1
+                LIMIT 20
+            """, pattern)
+        
+        if not users:
+            await update.message.reply_text(
+                "❌ Пользователи не найдены",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Новый поиск", callback_data="admin_users_search")],
+                    [InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]
+                ])
+            )
+            return ConversationHandler.END
+        
+        text = f"🔍 *Найдено пользователей: {len(users)}*\n\n"
+        keyboard = []
+        
+        for user in users:
+            status_emoji = "🟢" if user['status'] == 'active' else "🔴" if user['status'] == 'banned' else "🟡"
+            role_emoji = "👑" if user['role'] == 'super_admin' else "🔰" if user['role'] == 'admin' else "👤"
+            
+            text += f"{status_emoji}{role_emoji} *{user['first_name']}*"
+            if user['username']:
+                text += f" (@{user['username']})"
+            text += f"\n   🆔 `{user['user_id']}`\n\n"
+            
+            keyboard.append([InlineKeyboardButton(
+                f"📊 {user['first_name'][:15]}",
+                callback_data=f"admin_user_stats_{user['user_id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔄 Новый поиск", callback_data="admin_users_search")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_users")])
+        
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
     
-    async def _count_patients(self, tenant_id: int) -> int:
-        """Подсчет пациентов арендатора."""
-        return await db.fetchval(
-            "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'patient'",
-            tenant_id
+    async def admin_users_banned(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Список заблокированных пользователей."""
+        query = update.callback_query
+        await query.answer()
+        
+        users = await db.fetch("""
+            SELECT u.user_id, u.username, u.first_name, u.status, u.total_interactions,
+                   a.created_at as ban_date
+            FROM users u
+            LEFT JOIN admin_logs a ON u.user_id = a.target_user_id AND a.action = 'ban'
+            WHERE u.status = 'banned'
+            ORDER BY a.created_at DESC
+        """)
+        
+        if not users:
+            await self.safe_edit_message(
+                query,
+                "✅ Заблокированных пользователей нет",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]
+                ])
+            )
+            return
+        
+        text = "🚫 *Заблокированные пользователи*\n\n"
+        keyboard = []
+        
+        for user in users:
+            ban_date = user['ban_date'].strftime('%d.%m.%Y') if user['ban_date'] else "неизвестно"
+            
+            text += f"• *{user['first_name']}*"
+            if user['username']:
+                text += f" (@{user['username']})"
+            text += f"\n  🆔 `{user['user_id']}`"
+            text += f"\n  📅 Заблокирован: {ban_date}"
+            text += f"\n  📊 Активность: {user['total_interactions']}\n\n"
+            
+            keyboard.append([InlineKeyboardButton(
+                f"✅ Разблокировать {user['first_name'][:15]}",
+                callback_data=f"admin_user_unban_{user['user_id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_users")])
+        
+        await self.safe_edit_message(
+            query,
+            text[:4000],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_users_admins(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Список администраторов."""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        current_user = await db.fetchrow(
+            "SELECT role FROM users WHERE user_id = $1",
+            user_id
+        )
+        
+        admins = await db.fetch("""
+            SELECT user_id, username, first_name, role, created_at, total_interactions
+            FROM users 
+            WHERE role IN ('admin', 'super_admin')
+            ORDER BY 
+                CASE role
+                    WHEN 'super_admin' THEN 0
+                    ELSE 1
+                END,
+                created_at
+        """)
+        
+        text = "👑 *Администраторы*\n\n"
+        keyboard = []
+        
+        for admin in admins:
+            role_text = "👑 Главный" if admin['role'] == 'super_admin' else "🔰 Админ"
+            can_manage = current_user and current_user['role'] == 'super_admin' and admin['role'] != 'super_admin'
+            
+            text += f"{role_text}\n"
+            text += f"• *{admin['first_name']}*"
+            if admin['username']:
+                text += f" (@{admin['username']})"
+            text += f"\n  🆔 `{admin['user_id']}`"
+            text += f"\n  📅 с {admin['created_at'].strftime('%d.%m.%Y')}"
+            text += f"\n  📊 управляет {admin['total_interactions']} пользователями\n\n"
+            
+            if can_manage:
+                keyboard.append([InlineKeyboardButton(
+                    f"⬇️ Снять права {admin['first_name'][:10]}",
+                    callback_data=f"admin_user_remove_admin_{admin['user_id']}"
+                )])
+        
+        if current_user and current_user['role'] == 'super_admin':
+            keyboard.append([InlineKeyboardButton(
+                "➕ Назначить админа",
+                callback_data="admin_users_make_admin"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_users")])
+        
+        await self.safe_edit_message(
+            query,
+            text[:4000],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_user_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+        """Статистика пользователя."""
+        query = update.callback_query
+        
+        user = await db.fetchrow("""
+            SELECT * FROM users WHERE user_id = $1
+        """, target_user_id)
+        
+        if not user:
+            await self.safe_edit_message(
+                query,
+                "❌ Пользователь не найден",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data="admin_users_list")]
+                ])
+            )
+            return
+        
+        medicines = await db.fetchval(
+            "SELECT COUNT(*) FROM medicines WHERE user_id = $1",
+            target_user_id
         ) or 0
-    
-    async def _count_prescriptions(self, tenant_id: int) -> int:
-        """Подсчет назначений арендатора."""
-        return await db.fetchval("""
-            SELECT COUNT(*) FROM medicines m
-            JOIN users u ON u.user_id = m.user_id
-            WHERE u.tenant_id = $1 AND m.status = 'active'
-        """, tenant_id) or 0
-    
-    async def _get_adherence(self, tenant_id: int) -> float:
-        """Получение средней приверженности лечению."""
-        result = await db.fetchrow("""
-            SELECT 
-                AVG(CASE 
-                    WHEN m.total_taken + m.total_skipped > 0 
-                    THEN m.total_taken::float / (m.total_taken + m.total_skipped) * 100 
-                    ELSE NULL 
-                END) as avg_adherence
-            FROM medicines m
-            JOIN users u ON u.user_id = m.user_id
-            WHERE u.tenant_id = $1 AND m.status = 'active'
-        """, tenant_id)
         
-        return round(result["avg_adherence"] or 0, 1)
-    
-    async def run(self):
-        """Запуск бота."""
-        # Инициализация базы данных
-        await db.init_pool()
-        await subscriptions.init_tables()
-        await UserTables.init_tables()
+        analyses = await db.fetchval(
+            "SELECT COUNT(*) FROM analyses WHERE user_id = $1",
+            target_user_id
+        ) or 0
         
-        # Запуск бота
-        print(f"\n{'='*60}")
-        print(f"🚀 Запуск {config.BOT_NAME} v{config.BOT_VERSION}")
-        print(f"{'='*60}")
-        print(f"📊 База данных: PostgreSQL на {config.DB_HOST}:{config.DB_PORT}")
-        print(f"💾 Кэш: Redis на {config.REDIS_URL}")
-        print(f"💳 Платежи: Telegram Stars + ЮKassa")
-        print(f"{'='*60}\n")
+        mood_count = await db.fetchval(
+            "SELECT COUNT(*) FROM mood_logs WHERE user_id = $1",
+            target_user_id
+        ) or 0
         
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling()
+        symptoms = await db.fetchval(
+            "SELECT COUNT(*) FROM symptom_logs WHERE user_id = $1",
+            target_user_id
+        ) or 0
         
-        print("✅ Бот запущен и готов к работе!")
-        print("⏎ Нажмите Ctrl+C для остановки\n")
+        last_activity = await db.fetchrow(
+            "SELECT action, created_at FROM admin_logs WHERE target_user_id = $1 ORDER BY created_at DESC LIMIT 1",
+            target_user_id
+        )
         
-        # Ждем сигнала остановки
-        stop_signal = asyncio.Future()
+        active_reminders = await db.fetchval("""
+            SELECT COUNT(*) FROM reminders 
+            WHERE user_id = $1 AND status = 'pending'
+        """, target_user_id) or 0
         
-        def signal_handler():
-            stop_signal.set_result(None)
+        status_emoji = "🟢" if user['status'] == 'active' else "🔴" if user['status'] == 'banned' else "🟡"
+        role_emoji = "👑" if user['role'] == 'super_admin' else "🔰" if user['role'] == 'admin' else "👤"
         
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler)
-        
-        try:
-            await stop_signal
-        except KeyboardInterrupt:
-            pass
-        finally:
-            print("\n🛑 Останавливаем бота...")
-            await self.app.updater.stop()
-            await self.app.stop()
-            await self.app.shutdown()
-            await db.close()
-            await redis_cache.close()
-            print("✅ Бот остановлен")
+        text = f"""📊 *Статистика пользователя*
 
-# ============== ЗАПУСК ==============
+👤 {user['first_name']} (@{user['username'] or 'нет'})
+🆔 `{user['user_id']}`
+📅 Регистрация: {user['created_at'].strftime('%d.%m.%Y')}
+⏱️ Последний визит: {user['last_seen'].strftime('%d.%m.%Y %H:%M')}
+🎯 Взаимодействий: {user['total_interactions']}
+
+💊 Лекарств: {medicines}
+🩺 Анализов: {analyses}
+😊 Записей настроения: {mood_count}
+🤒 Записей симптомов: {symptoms}
+
+🔹 Статус: {user['status']} {status_emoji}
+🔹 Роль: {user['role']} {role_emoji}
+🔹 Часовой пояс: {user['timezone']}"""
+
+        if last_activity:
+            text += f"\n📋 Последнее действие: {last_activity['action']} ({last_activity['created_at'].strftime('%d.%m.%Y %H:%M')})"
+        
+        text += f"\n⏰ Активных напоминаний: {active_reminders}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 К списку", callback_data="admin_users_list")]]
+        
+        action_row = []
+        if user['status'] != 'banned':
+            action_row.append(InlineKeyboardButton("🚫 Заблокировать", callback_data=f"admin_user_ban_{target_user_id}"))
+        else:
+            action_row.append(InlineKeyboardButton("✅ Разблокировать", callback_data=f"admin_user_unban_{target_user_id}"))
+        
+        if user['role'] == 'user':
+            action_row.append(InlineKeyboardButton("👑 Сделать админом", callback_data=f"admin_user_make_admin_{target_user_id}"))
+        elif user['role'] == 'admin':
+            action_row.append(InlineKeyboardButton("⬇️ Снять права", callback_data=f"admin_user_remove_admin_{target_user_id}"))
+        
+        if action_row:
+            keyboard.insert(0, action_row)
+        
+        await self.safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def _admin_ban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Блокировка пользователя."""
+        admin_id = update.effective_user.id
+        
+        user = await db.fetchrow(
+            "SELECT first_name FROM users WHERE user_id = $1",
+            user_id
+        )
+        
+        if user:
+            await db.execute(
+                "UPDATE users SET status = 'banned', updated_at = CURRENT_TIMESTAMP WHERE user_id = $1",
+                user_id
+            )
+            
+            await db.execute("""
+                INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+                VALUES ($1, 'ban', $2, $3)
+            """, admin_id, user_id, json.dumps({"username": user['first_name']}))
+            
+            await db.execute("""
+                UPDATE reminders SET status = 'cancelled' 
+                WHERE user_id = $1 AND status = 'pending'
+            """, user_id)
+            
+            logger.log('info', f"Пользователь {user_id} заблокирован")
+        
+        await update.callback_query.edit_message_text(
+            f"✅ Пользователь {user['first_name']} заблокирован",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К списку", callback_data="admin_users_list")]
+            ])
+        )
+    
+    async def _admin_unban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Разблокировка пользователя."""
+        admin_id = update.effective_user.id
+        
+        user = await db.fetchrow(
+            "SELECT first_name FROM users WHERE user_id = $1",
+            user_id
+        )
+        
+        if user:
+            await db.execute(
+                "UPDATE users SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE user_id = $1",
+                user_id
+            )
+            
+            await db.execute("""
+                INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+                VALUES ($1, 'unban', $2, $3)
+            """, admin_id, user_id, json.dumps({"username": user['first_name']}))
+            
+            logger.log('info', f"Пользователь {user_id} разблокирован")
+        
+        await update.callback_query.edit_message_text(
+            f"✅ Пользователь {user['first_name']} разблокирован",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К списку", callback_data="admin_users_list")]
+            ])
+        )
+    
+    async def _admin_make_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Назначение администратором."""
+        admin_id = update.effective_user.id
+        
+        current_admin = await db.fetchrow(
+            "SELECT role FROM users WHERE user_id = $1",
+            admin_id
+        )
+        
+        if not current_admin or current_admin['role'] != 'super_admin':
+            await update.callback_query.answer(
+                "❌ Только главный администратор может назначать админов",
+                show_alert=True
+            )
+            return
+        
+        user = await db.fetchrow(
+            "SELECT first_name FROM users WHERE user_id = $1",
+            user_id
+        )
+        
+        if user:
+            await db.execute(
+                "UPDATE users SET role = 'admin', updated_at = CURRENT_TIMESTAMP WHERE user_id = $1",
+                user_id
+            )
+            
+            await db.execute("""
+                INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+                VALUES ($1, 'make_admin', $2, $3)
+            """, admin_id, user_id, json.dumps({"username": user['first_name']}))
+            
+            logger.log('info', f"Пользователь {user_id} назначен администратором")
+        
+        await update.callback_query.edit_message_text(
+            f"✅ {user['first_name']} теперь администратор",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К списку", callback_data="admin_users_list")]
+            ])
+        )
+    
+    async def _admin_remove_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Снятие прав администратора."""
+        admin_id = update.effective_user.id
+        
+        current_admin = await db.fetchrow(
+            "SELECT role FROM users WHERE user_id = $1",
+            admin_id
+        )
+        
+        if not current_admin or current_admin['role'] != 'super_admin':
+            await update.callback_query.answer(
+                "❌ Только главный администратор может снимать права",
+                show_alert=True
+            )
+            return
+        
+        user = await db.fetchrow(
+            "SELECT first_name FROM users WHERE user_id = $1",
+            user_id
+        )
+        
+        if user:
+            await db.execute(
+                "UPDATE users SET role = 'user', updated_at = CURRENT_TIMESTAMP WHERE user_id = $1",
+                user_id
+            )
+            
+            await db.execute("""
+                INSERT INTO admin_logs (admin_id, action, target_user_id, details)
+                VALUES ($1, 'remove_admin', $2, $3)
+            """, admin_id, user_id, json.dumps({"username": user['first_name']}))
+            
+            logger.log('info', f"Пользователь {user_id} лишен прав администратора")
+        
+        await update.callback_query.edit_message_text(
+            f"✅ Права администратора у {user['first_name']} сняты",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К списку", callback_data="admin_users_list")]
+            ])
+        )
+    
+    async def admin_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Просмотр логов."""
+        query = update.callback_query
+        
+        log_dir = Path("logs")
+        logs_text = "📝 *Логи системы*\n\n"
+        
+        log_files = ['error.log', 'info.log', 'debug.log', 'crash.log']
+        
+        for log_file in log_files:
+            file_path = log_dir / log_file
+            if file_path.exists():
+                try:
+                    async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                        lines = await f.readlines()
+                        logs_text += f"*{log_file}:*\n"
+                        logs_text += ''.join(lines[-10:]) + "\n\n"
+                except Exception:
+                    logs_text += f"*{log_file}:* ошибка чтения\n\n"
+            else:
+                logs_text += f"*{log_file}:* файл не найден\n\n"
+        
+        if len(logs_text) > 4000:
+            logs_text = logs_text[:4000] + "...\n(сообщение обрезано)"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data="admin_logs")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]
+        ]
+        
+        await self.safe_edit_message(
+            query,
+            logs_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_broadcast_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало рассылки."""
+        query = update.callback_query
+        
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        context.user_data['broadcast'] = {}
+        await self.safe_edit_message(
+            query,
+            "📢 *Создание рассылки*\n\nВведите текст сообщения:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.BROADCAST_MESSAGE
+    
+    async def admin_broadcast_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка текста рассылки."""
+        if not await self._check_admin_by_id(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав доступа")
+            return ConversationHandler.END
+        
+        message = update.message.text
+        context.user_data['broadcast']['message'] = message
+        
+        preview_text = f"""📢 *Предпросмотр рассылки*
+
+Сообщение:
+{message}
+
+Отправить?"""
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Отправить", callback_data="admin_broadcast_confirm"),
+             InlineKeyboardButton("❌ Отмена", callback_data="admin_broadcast_cancel")]
+        ]
+        
+        await update.message.reply_text(
+            preview_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return States.BROADCAST_CONFIRM
+    
+    async def admin_broadcast_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подтверждение рассылки."""
+        query = update.callback_query
+        await query.answer()
+        
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        broadcast_data = context.user_data.get('broadcast', {})
+        message = broadcast_data.get('message', '')
+        
+        await self.safe_edit_message(
+            query,
+            "📢 *Рассылка началась*\n\n⏳ Подготовка...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        users = await db.fetch(
+            "SELECT user_id FROM users WHERE status = 'active' AND notifications_enabled = TRUE"
+        )
+        total = len(users)
+        
+        sent = 0
+        failed = 0
+        
+        for i, user in enumerate(users, 1):
+            try:
+                await self.safe_send_message(
+                    user['user_id'],
+                    f"📢 *Информационное сообщение*\n\n{message}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.log_error(e, {'user_id': user['user_id']})
+            
+            if i % 10 == 0:
+                await asyncio.sleep(1)
+            
+            if i % 50 == 0:
+                await self.safe_edit_message(
+                    query,
+                    f"📢 *Рассылка*\n\n⏳ Прогресс: {i}/{total}\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        
+        report = f"""📢 *Рассылка завершена*
+
+✅ Успешно: {sent}
+❌ Ошибок: {failed}
+📊 Всего: {total}
+📈 Доставка: {(sent/total*100) if total > 0 else 0:.1f}%"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_panel")]]
+        await self.safe_edit_message(
+            query,
+            report,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        context.user_data.pop('broadcast', None)
+        return ConversationHandler.END
+    
+    async def admin_broadcast_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена рассылки."""
+        query = update.callback_query
+        await query.answer()
+        
+        context.user_data.pop('broadcast', None)
+        keyboard = [[InlineKeyboardButton("🔙 В админ-панель", callback_data="admin_panel")]]
+        await self.safe_edit_message(
+            query,
+            "❌ Рассылка отменена",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
+    
+    async def admin_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Резервное копирование."""
+        query = update.callback_query
+        
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        backup_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Бэкап базы данных
+        if config.USE_SQLITE:
+            import shutil
+            if os.path.exists(config.SQLITE_PATH):
+                shutil.copy2(config.SQLITE_PATH, f"backup_{backup_time}.db")
+        
+        text = f"""✅ *Резервное копирование выполнено*
+
+📁 Файл: backup_{backup_time}.db
+📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]]
+        await self.safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def admin_version(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Информация о версии."""
+        query = update.callback_query
+        
+        if not await self._check_admin_by_id(update.effective_user.id):
+            keyboard = [[InlineKeyboardButton("🏠 Главная", callback_data="start")]]
+            await self.safe_edit_message(
+                query,
+                "❌ У вас нет прав доступа",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        text = f"""ℹ️ *Информация о версии*
+
+📱 *Бот:* {config.BOT_NAME}
+🔢 *Версия:* {config.BOT_VERSION}
+📅 *Дата:* {config.BOT_VERSION_DATE}
+👨‍⚕️ *Автор:* Денис Казарин
+
+🛠 *Компоненты:*
+• python-telegram-bot: 20.7
+• asyncpg: 0.29.0
+• APScheduler: 3.10.4
+• Redis: 5.0.1
+
+📊 *Статус:* Стабильная версия с PostgreSQL"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")]]
+        await self.safe_edit_message(
+            query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# ============== ОСНОВНАЯ ФУНКЦИЯ ==============
+
+async def main():
+    """Главная функция запуска."""
+    print("\n" + "="*80)
+    print(f"🚀 Запуск {config.BOT_NAME} v{config.BOT_VERSION}")
+    print("="*80)
+    
+    print(f"📊 Версия: {config.BOT_VERSION} от {config.BOT_VERSION_DATE}")
+    if config.USE_SQLITE:
+        print(f"💾 База данных: SQLite ({config.SQLITE_PATH})")
+    else:
+        print(f"💾 База данных: PostgreSQL на {config.DB_HOST}:{config.DB_PORT}")
+    print(f"📊 Метрики: порт 9090")
+    print(f"⚡ Оптимизации: пул соединений, кэширование, пагинация")
+    print("-"*80)
+    
+    # Отключение webhook
+    try:
+        import requests
+        requests.get(f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook")
+        print(f"✅ Webhook отключен")
+    except Exception as e:
+        print(f"⚠️ Ошибка при отключении webhook: {e}")
+    
+    # Инициализация базы данных
+    await db.init_pool()
+    await init_database()
+    print(f"✅ База данных инициализирована")
+    
+    # Проверка Redis
+    if config.REDIS_ENABLED:
+        redis_conn = await redis_cache.get_connection()
+        if redis_conn:
+            print(f"✅ Redis подключен")
+        else:
+            print(f"⚠️ Redis не доступен, кэширование отключено")
+    
+    # Создание приложения
+    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+    
+    # Установка команд бота
+    commands = [
+        BotCommand("start", "🚀 Главное меню"),
+        BotCommand("help", "❓ Помощь"),
+        BotCommand("about", "👨‍⚕️ О враче"),
+        BotCommand("stats", "📈 Статистика"),
+        BotCommand("mood", "📊 Самочувствие"),
+        BotCommand("settimezone", "🕒 Часовой пояс"),
+        BotCommand("list_medicines", "📋 Список лекарств"),
+        BotCommand("list_analyses", "📋 Список анализов"),
+        BotCommand("add_medicine", "💊 Добавить лекарство"),
+        BotCommand("add_analysis", "🩺 Добавить анализ"),
+        BotCommand("take_unscheduled", "💊 Принять препарат"),
+    ]
+    await app.bot.set_my_commands(commands)
+    print(f"✅ Команды бота установлены")
+    
+    # Запуск планировщика
+    scheduler.set_application(app)
+    scheduler.start()
+    await scheduler.restore_reminders()
+    
+    # Создание обработчиков
+    handlers = Handlers(app, scheduler, rate_limiter)
+    
+    # Периодическая проверка целостности
+    async def integrity_check():
+        """Проверка целостности напоминаний."""
+        try:
+            now_utc = datetime.now(pytz.UTC)
+            
+            pending = await db.fetch("""
+                SELECT * FROM reminders 
+                WHERE status = 'pending' AND scheduled_time > $1
+            """, now_utc)
+            
+            pending_ids = {f"{r['reminder_type']}_{r['id']}" for r in pending}
+            scheduler_jobs = scheduler.scheduler.get_jobs()
+            scheduler_ids = {job.id for job in scheduler_jobs}
+            
+            missing = pending_ids - scheduler_ids
+            for job_id in missing:
+                parts = job_id.split('_')
+                reminder_id = int(parts[-1])
+                reminder = await db.fetchrow(
+                    "SELECT * FROM reminders WHERE id = $1",
+                    reminder_id
+                )
+                
+                if reminder and reminder['scheduled_time'] > now_utc:
+                    scheduler.scheduler.add_job(
+                        scheduler.send_reminder,
+                        trigger=DateTrigger(run_date=reminder['scheduled_time']),
+                        id=job_id,
+                        args=[reminder_id],
+                        replace_existing=True
+                    )
+                    logger.log('warning', f"Восстановлено задание {job_id}")
+            
+            dead = scheduler_ids - pending_ids
+            for job_id in dead:
+                if job_id.startswith(('medicine_', 'analysis_', 'investigation_')):
+                    try:
+                        scheduler.scheduler.remove_job(job_id)
+                    except JobLookupError:
+                        pass
+            
+            logger.log('info', f"Проверка целостности: восст. {len(missing)}, удалено {len(dead)}")
+            
+        except Exception as e:
+            logger.log_error(e, {'task': 'integrity_check'})
+    
+    app.job_queue.run_repeating(
+        lambda ctx: asyncio.create_task(integrity_check()),
+        interval=config.INTEGRITY_CHECK_INTERVAL,
+        first=10,
+        name="integrity_check"
+    )
+    
+    print("\n✅ Бот запущен и готов к работе!")
+    print("📡 Режим: Long Polling")
+    print("💬 Отправьте любое сообщение в Telegram")
+    print("⏎ Нажмите Ctrl+C для остановки")
+    print("="*80 + "\n")
+    
+    # Запуск бота
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
+    
+    # Ожидание сигнала остановки
+    stop_signal = asyncio.Future()
+    
+    def signal_handler():
+        if not stop_signal.done():
+            stop_signal.set_result(None)
+    
+    if os.name != 'nt':
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+    
+    try:
+        await stop_signal
+    except KeyboardInterrupt:
+        print("\n\n🛑 Получен сигнал остановки")
+    finally:
+        print("🛑 Завершаем работу...")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        scheduler.shutdown()
+        await db.close()
+        await redis_cache.close()
+        logger.log('info', "Бот остановлен корректно")
+        print("✅ Бот остановлен")
 
 if __name__ == "__main__":
-    bot = LorBot()
-    asyncio.run(bot.run())
+    asyncio.run(main())
