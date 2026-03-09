@@ -1,53 +1,75 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+print_header "МОНИТОРИНГ СИСТЕМЫ"
 
-echo -e "${GREEN}📊 Мониторинг ЛОР-Помощника${NC}"
-echo "========================================"
+# Информация о системе
+echo -e "${CYAN}📊 СИСТЕМА:${NC}"
+echo -e "  🖥️  Хост: $(hostname)"
+echo -e "  🕒 Время: $(date)"
+echo -e "  📊 Нагрузка: $(uptime | awk '{print $8 $9 $10}')"
+echo
 
-# Статус контейнеров
-echo -e "\n${YELLOW}🔍 Статус контейнеров:${NC}"
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep lor-bot
+# Информация о боте
+echo -e "${CYAN}🤖 БОТ:${NC}"
+if check_bot_running; then
+    PID=$(get_bot_pid)
+    CPU=$(ps -p $PID -o %cpu= 2>/dev/null | tr -d ' ' || echo "N/A")
+    MEM=$(ps -p $PID -o %mem= 2>/dev/null | tr -d ' ' || echo "N/A")
+    RUNTIME=$(ps -p $PID -o etime= 2>/dev/null | tr -d ' ' || echo "N/A")
+    
+    echo -e "  ✅ Статус: ${GREEN}Работает${NC}"
+    echo -e "  📊 PID: $PID"
+    echo -e "  💻 CPU: $CPU%"
+    echo -e "  🧮 RAM: $MEM%"
+    echo -e "  ⏱️  Время: $RUNTIME"
+else
+    echo -e "  ❌ Статус: ${RED}Не работает${NC}"
+fi
+echo
 
-# Использование ресурсов
-echo -e "\n${YELLOW}📈 Использование ресурсов:${NC}"
-docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" | grep lor-bot
+# Информация о PostgreSQL
+echo -e "${CYAN}🗄️  POSTGRESQL:${NC}"
+if command -v psql &> /dev/null; then
+    if pg_isready -q 2>/dev/null; then
+        echo -e "  ✅ Статус: ${GREEN}Работает${NC}"
+        
+        # Размер базы данных
+        if [ -f ".env" ]; then
+            export $(grep -v '^#' .env | xargs)
+            DB_SIZE=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT pg_size_pretty(pg_database_size('$DB_NAME'));" 2>/dev/null | tr -d ' ')
+            CONNECTIONS=$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | tr -d ' ')
+            
+            echo -e "  📦 Размер БД: ${DB_SIZE:-N/A}"
+            echo -e "  🔌 Соединений: ${CONNECTIONS:-N/A}"
+        fi
+    else
+        echo -e "  ❌ Статус: ${RED}Не работает${NC}"
+    fi
+fi
+echo
 
-# Логи за последние 10 минут
-echo -e "\n${YELLOW}📝 Последние ошибки в логах:${NC}"
-docker-compose logs --tail=50 bot | grep -i error || echo "Ошибок не найдено"
+# Информация о Redis
+echo -e "${CYAN}💾 REDIS:${NC}"
+if command -v redis-cli &> /dev/null; then
+    if redis-cli ping &>/dev/null; then
+        echo -e "  ✅ Статус: ${GREEN}Работает${NC}"
+        
+        REDIS_MEM=$(redis-cli info memory | grep "used_memory_human:" | cut -d: -f2 | tr -d ' ')
+        REDIS_KEYS=$(redis-cli dbsize)
+        
+        echo -e "  💾 Память: ${REDIS_MEM:-N/A}"
+        echo -e "  🔑 Ключей: ${REDIS_KEYS:-N/A}"
+    else
+        echo -e "  ❌ Статус: ${RED}Не работает${NC}"
+    fi
+fi
+echo
 
-# Проверка базы данных
-echo -e "\n${YELLOW}🗄️  Статус базы данных:${NC}"
-docker exec lor-bot-postgres pg_isready -U lor_bot && echo "✅ PostgreSQL работает" || echo "❌ PostgreSQL не отвечает"
-
-# Проверка Redis
-echo -e "\n${YELLOW}💾 Статус Redis:${NC}"
-docker exec lor-bot-redis redis-cli ping | grep -q PONG && echo "✅ Redis работает" || echo "❌ Redis не отвечает"
-
-# Метрики Prometheus
-echo -e "\n${YELLOW}📊 Метрики Prometheus:${NC}"
-curl -s http://localhost:9090/api/v1/query?query=up | grep -q "success" && echo "✅ Prometheus доступен" || echo "❌ Prometheus не отвечает"
-
-# Активные подписки
-echo -e "\n${YELLOW}💳 Активные подписки:${NC}"
-docker exec lor-bot-postgres psql -U lor_bot -d lor_bot -c "
-    SELECT plan_code, COUNT(*) as count 
-    FROM user_subscriptions 
-    WHERE status = 'active' 
-    GROUP BY plan_code
-    ORDER BY count DESC;
-"
-
-# Пользователи онлайн за последний час
-echo -e "\n${YELLOW}👥 Пользователи онлайн:${NC}"
-docker exec lor-bot-postgres psql -U lor_bot -d lor_bot -c "
-    SELECT COUNT(*) 
-    FROM users 
-    WHERE last_seen > NOW() - INTERVAL '1 hour';
-"
-
-echo "========================================"
+# Информация о диске
+echo -e "${CYAN}💿 ДИСК:${NC}"
+DISK_USAGE=$(df -h . | awk 'NR==2 {print $5}')
+DISK_AVAIL=$(df -h . | awk 'NR==2 {print $4}')
+echo -e "  📊 Использовано: $DISK_USAGE"
+echo -e "  💿 Доступно: $DISK_AVAIL"
